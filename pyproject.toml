@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prefworld"
+version = "0.1.0"
+description = "Preference-conditioned structured world model for nuPlan DBs + HD map (PyTorch)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "PrefWorld Contributors"}]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "tqdm>=4.66",
+  "omegaconf>=2.3",
+  "pyyaml>=6.0",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["black", "isort", "ruff", "pytest"]
+
+[tool.setuptools]
+packages = ["prefworld"]
+
+[tool.setuptools.package-dir]
+prefworld = "prefworld"

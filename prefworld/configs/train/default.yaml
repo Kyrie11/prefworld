@@ -1,0 +1,35 @@
+dataset:
+  cache_dir: /path/to/cache/prefworld
+  train_split: train
+  val_split: val
+  max_train_samples: null
+  max_val_samples: null
+
+model:
+  agent_feat_dim: 7
+  z_dim: 8
+  pc_hidden: 64
+  intent_hidden: 128
+  energy_hidden: 128
+  eb_temperature: 1.0
+  eb_max_candidates: 64
+
+train:
+  output_dir: ./outputs/run1
+  seed: 42
+  batch_size: 32
+  num_workers: 4
+  max_epochs: 20
+  grad_clip_norm: 5.0
+  pc_drop_prob: 0.2
+
+  # Loss weights
+  w_pc: 1.0
+  w_kl: 0.1
+  w_intent: 1.0
+  w_eb: 1.0
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]

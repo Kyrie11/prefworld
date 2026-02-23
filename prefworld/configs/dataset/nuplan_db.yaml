@@ -1,0 +1,53 @@
+dataset:
+  # Path to a directory that contains nuPlan DB logs (e.g., nuplan-v1.1/splits/train)
+  data_root: /path/to/nuplan-v1.1/splits/train
+  # Path to a directory that contains nuPlan maps (e.g., nuplan-v1.1/maps)
+  map_root: /path/to/nuplan-v1.1/maps
+  map_version: nuplan-maps-v1.0
+
+  # Optional: provide a dir/file/list for log DB discovery
+  db_files: null
+  sensor_root: null  # not used (no sensors), but required by nuPlan scenario builder
+
+  # Scenario builder controls
+  max_workers: 8
+  scenario_types: null          # e.g., ["LANE_FOLLOWING", "UNPROTECTED_LEFT_TURN"]
+  scenario_tokens: null
+  log_names: null
+  shuffle: true
+  expand_scenarios: false
+  num_scenarios_per_type: null
+  limit_total_scenarios: null
+
+  # Cache output
+  cache_dir: /path/to/cache/prefworld
+  split: train
+
+  # Sampling inside each scenario (iterations)
+  sample_stride: 10            # every N iterations (DB is ~20Hz)
+  min_iteration: 0
+  max_samples_per_scenario: null
+  max_total_samples: null
+
+  extraction:
+    past_horizon_s: 2.0
+    past_num_samples: 20
+    future_horizon_s: 8.0
+    future_num_samples: 80
+
+    max_agents: 20
+    agent_radius_m: 50.0
+    keep_only_vehicles: true
+
+    map_radius_m: 60.0
+    max_map_polylines: 256
+    polyline_points: 20
+    include_route: true
+
+    structure_delta_s: 1.0
+    structure_conflict_dist_m: 3.0
+    structure_conflict_radius_m: 2.0
+
+    stop_dist_threshold_m: 1.0
+    lateral_threshold_m: 2.0
+    turn_threshold_rad: 0.4
