@@ -52,6 +52,11 @@ class AgentHistoryEncoder(nn.Module):
 
     def forward(self, hist: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """hist: [B*N, T, Din], mask: [B*N,T]."""
+        # nuPlan agent tracks may appear mid-history, so masks are often *suffix*-valid
+        # (e.g., 0 0 1 1 1). pack_padded_sequence expects *prefix*-valid masks.
+        # We reverse time so valid steps become a prefix (1 1 1 0 0).
+        hist = torch.flip(hist, dims=[1])
+        mask = torch.flip(mask, dims=[1])
         lengths = mask.sum(dim=1).clamp_min(1).to(torch.int64)
         packed = nn.utils.rnn.pack_padded_sequence(hist, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_out, h = self.gru(packed)
@@ -69,6 +74,7 @@ class IntentionNet(nn.Module):
         z_dim: int,
         hidden_dim: int = 128,
         ctx_dim: int = 128,
+        tau_dim: int = 0,
         num_maneuvers: int = NUM_MANEUVERS,
     ):
         super().__init__()
@@ -76,7 +82,9 @@ class IntentionNet(nn.Module):
         self.map_enc = PolylineEncoder(point_dim=2, hidden_dim=hidden_dim, out_dim=ctx_dim)
         self.ego_plan_enc = PolylineEncoder(point_dim=3, hidden_dim=hidden_dim, out_dim=ctx_dim)
 
-        in_dim = ctx_dim + z_dim + ctx_dim + ctx_dim
+        self.tau_dim = int(tau_dim)
+
+        in_dim = ctx_dim + z_dim + ctx_dim + ctx_dim + self.tau_dim
         self.head = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -93,6 +101,7 @@ class IntentionNet(nn.Module):
         map_polylines: torch.Tensor,      # [B,M,L,2]
         map_poly_mask: torch.Tensor,      # [B,M]
         ego_future: torch.Tensor,         # [B,Tf,3] ego candidate plan in ego-local coords
+        tau_curr: Optional[torch.Tensor] = None,  # [B,N,Dt] agent-centric template embedding at current step
     ) -> torch.Tensor:
         B, N, T, Din = agents_hist.shape
         # agent embedding
@@ -109,6 +118,10 @@ class IntentionNet(nn.Module):
         map_emb_exp = map_emb.unsqueeze(1).expand(B, N, map_emb.shape[-1])
         ego_emb_exp = ego_emb.unsqueeze(1).expand(B, N, ego_emb.shape[-1])
 
-        x = torch.cat([agent_emb, z, map_emb_exp, ego_emb_exp], dim=-1)
+        if self.tau_dim > 0:
+            assert tau_curr is not None, "tau_curr must be provided when tau_dim>0"
+            x = torch.cat([agent_emb, z, map_emb_exp, ego_emb_exp, tau_curr], dim=-1)
+        else:
+            x = torch.cat([agent_emb, z, map_emb_exp, ego_emb_exp], dim=-1)
         logits = self.head(x)  # [B,N,K]
         return logits

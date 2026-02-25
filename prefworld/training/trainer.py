@@ -79,7 +79,6 @@ def train(
 
             loss = (
                 cfg.w_pc * out.losses["loss_pc"]
-                + cfg.w_kl * out.losses["loss_kl"]
                 + cfg.w_intent * out.losses["loss_intent"]
                 + cfg.w_eb * out.losses["loss_eb"]
             )

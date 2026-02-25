@@ -351,7 +351,23 @@ def extract_sample(
     ego_yaw = float(ego_vec[3])
 
     # Ego past/future
-    ego_past = list(scenario.get_ego_past_trajectory(iteration, cfg.past_horizon_s, cfg.past_num_samples))
+    # NOTE: nuPlan's get_ego_past_trajectory / get_past_tracked_objects typically DO NOT include the
+    # current frame at `iteration`. We explicitly append the current frame so that the last history
+    # step corresponds to the current time (ego-local origin).
+    # We therefore request Tp-1 past samples and append current -> Tp total.
+    Tp = int(cfg.past_num_samples)
+    past_num = max(0, Tp - 1)
+    ego_past = list(scenario.get_ego_past_trajectory(iteration, cfg.past_horizon_s, past_num))
+    ego_past.append(ego_state)
+    # ensure length Tp
+    if len(ego_past) != Tp:
+        if len(ego_past) == 0:
+            ego_past = [ego_state] * Tp
+        elif len(ego_past) < Tp:
+            ego_past = ego_past + [ego_past[-1]] * (Tp - len(ego_past))
+        else:
+            ego_past = ego_past[-Tp:]
+
     ego_future = list(scenario.get_ego_future_trajectory(iteration, cfg.future_horizon_s, cfg.future_num_samples))
 
     ego_past_vec = np.stack([_ego_state_to_vector(s) for s in ego_past], axis=0)  # [Tp, 9]
@@ -383,7 +399,6 @@ def extract_sample(
     track_tokens = [_get_track_token(x[1]) for x in filtered]
     N = len(track_tokens)
     # Prepare arrays
-    Tp = cfg.past_num_samples
     Tf = cfg.future_num_samples
     D = 7  # x,y,yaw,vx,vy,length,width
 
@@ -394,16 +409,18 @@ def extract_sample(
     agents_future_mask = np.zeros((cfg.max_agents, Tf), dtype=np.float32)
 
     # Build dicts for past and future frames
-    past_tracks = list(scenario.get_past_tracked_objects(iteration, cfg.past_horizon_s, cfg.past_num_samples))
+    past_tracks = list(scenario.get_past_tracked_objects(iteration, cfg.past_horizon_s, past_num))
+    past_tracks.append(detections)
     # Ensure length Tp
     if len(past_tracks) != Tp:
         # If scenario doesn't have enough, pad by repeating last available
         if len(past_tracks) == 0:
-            past_tracks = [scenario.get_tracked_objects_at_iteration(iteration)] * Tp
-        else:
+            past_tracks = [detections] * Tp
+        elif len(past_tracks) < Tp:
             last = past_tracks[-1]
             past_tracks = past_tracks + [last] * (Tp - len(past_tracks))
-            past_tracks = past_tracks[:Tp]
+        else:
+            past_tracks = past_tracks[-Tp:]
 
     future_tracks = []
     if include_future_agents:
@@ -554,12 +571,22 @@ def extract_sample(
     route_ids = scenario.get_route_roadblock_ids() if cfg.include_route else None
     map_feat = _extract_map_polylines(scenario.map_api, ego_xy, ego_yaw, route_ids, tl_dict, cfg)
 
+    # Ego dynamics (vx,vy,ax,ay) rotated into the same ego-local frame as positions.
+    # nuPlan EgoState exposes dynamics in the global frame; rotate by current ego_yaw.
+    ego_vel_hist_local = global_to_local_xy(ego_past_vec[:, 4:6], np.zeros(2, dtype=np.float32), ego_yaw)
+    ego_acc_hist_local = global_to_local_xy(ego_past_vec[:, 6:8], np.zeros(2, dtype=np.float32), ego_yaw)
+    ego_dyn_hist_local = np.concatenate([ego_vel_hist_local, ego_acc_hist_local], axis=-1)
+
+    ego_vel_fut_local = global_to_local_xy(ego_future_vec[:, 4:6], np.zeros(2, dtype=np.float32), ego_yaw)
+    ego_acc_fut_local = global_to_local_xy(ego_future_vec[:, 6:8], np.zeros(2, dtype=np.float32), ego_yaw)
+    ego_dyn_fut_local = np.concatenate([ego_vel_fut_local, ego_acc_fut_local], axis=-1)
+
     out: Dict[str, np.ndarray] = {
         # Ego
         "ego_hist": ego_past_local.astype(np.float32),   # [Tp, 3]
         "ego_future": ego_future_local.astype(np.float32),  # [Tf, 3]
-        "ego_dyn_hist": ego_past_vec[:, 4:8].astype(np.float32),  # [Tp, 4] vx,vy,ax,ay
-        "ego_dyn_future": ego_future_vec[:, 4:8].astype(np.float32),  # [Tf, 4]
+        "ego_dyn_hist": ego_dyn_hist_local.astype(np.float32),  # [Tp, 4] vx,vy,ax,ay (ego-local)
+        "ego_dyn_future": ego_dyn_fut_local.astype(np.float32),  # [Tf, 4] (ego-local)
         "ego_maneuver": ego_maneuver,  # [1]
         # Agents
         "agents_hist": agents_hist,  # [Nmax, Tp, D]

@@ -15,6 +15,7 @@ class EBSTMOutput:
     """Output of a one-step EB-STM transition."""
 
     candidate_A: torch.Tensor   # [B,C,K,K]
+    candidate_mask: torch.Tensor  # [B,C] bool
     energies: torch.Tensor      # [B,C]
     probs: torch.Tensor         # [B,C]
     pair_energies: PairEnergies # pair energies for the factual belief (for reweighting)
@@ -64,10 +65,13 @@ class EBSTM(nn.Module):
         agent_feat: torch.Tensor, # [B,K,Da]
         agent_mask: torch.Tensor, # [B,K]
         oracle_next: Optional[torch.Tensor] = None,  # [B,K,K]
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate a candidate set of next adjacency matrices per batch item.
 
         For simplicity, we generate candidates independently per batch element; we then pad to max_candidates.
+        Returns:
+          candidate_A:   [B,C,K,K]
+          candidate_mask:[B,C] (True for valid candidate)
         """
         B, K, _ = A_t.shape
         dist = self._pair_distance(agent_feat)  # [B,K,K]
@@ -128,24 +132,64 @@ class EBSTM(nn.Module):
                         A2[i, j] = 1
                         cand.append(A2)
 
-            # ensure oracle included
-            if oracle_next is not None:
-                A_or = oracle_next[b]
-                cand.append(A_or.clone())
-
             cand = _unique_adjacency(cand)
-            # truncate
-            cand = cand[: self.max_candidates]
+
+            # Ensure oracle is included and never truncated away.
+            if oracle_next is not None:
+                A_or = oracle_next[b].clone()
+                # Reorder: [A_t, A_or, ...]
+                new: List[torch.Tensor] = []
+                new.append(Ab.clone())
+                if not torch.equal(A_or, new[0]):
+                    new.append(A_or)
+                for A in cand:
+                    if torch.equal(A, new[0]) or (len(new) > 1 and torch.equal(A, new[1])):
+                        continue
+                    new.append(A)
+                    if len(new) >= self.max_candidates:
+                        break
+                cand = new
+            else:
+                cand = cand[: self.max_candidates]
+
             candidates_all.append(cand)
 
         # pad to [B,C,K,K]
         C = max(len(c) for c in candidates_all)
         C = min(C, self.max_candidates)
         out = torch.zeros((B, C, K, K), device=A_t.device, dtype=A_t.dtype)
+        out_mask = torch.zeros((B, C), device=A_t.device, dtype=torch.bool)
         for b, cand in enumerate(candidates_all):
-            for c_idx in range(min(C, len(cand))):
+            n = min(C, len(cand))
+            for c_idx in range(n):
                 out[b, c_idx] = cand[c_idx]
-        return out
+            out_mask[b, :n] = True
+        return out, out_mask
+
+    @staticmethod
+    def energy_of_structure(pair: PairEnergies, A: torch.Tensor) -> torch.Tensor:
+        """Compute total energy ε(A) by summing token energies over unordered pairs.
+
+        pair: PairEnergies with e_dir/e_none and pair_mask
+        A:    [B,K,K] adjacency (0/1)
+        Returns:
+          E: [B]
+        """
+        e_dir, e_none, pm = pair.e_dir, pair.e_none, pair.pair_mask
+        B, K, _ = A.shape
+        E = torch.zeros((B,), device=A.device, dtype=torch.float32)
+        A_bin = (A > 0.5)
+        for i in range(K):
+            for j in range(i + 1, K):
+                valid = pm[:, i, j]
+                if not valid.any():
+                    continue
+                # choose directed vs none
+                a_ij = A_bin[:, i, j]
+                a_ji = A_bin[:, j, i]
+                e = torch.where(a_ij, e_dir[:, i, j], torch.where(a_ji, e_dir[:, j, i], e_none[:, i, j]))
+                E = E + e.to(dtype=E.dtype) * valid.to(dtype=E.dtype)
+        return E
 
     def forward(
         self,
@@ -156,20 +200,22 @@ class EBSTM(nn.Module):
         agent_mask: torch.Tensor, # [B,K]
         oracle_next: Optional[torch.Tensor] = None,  # [B,K,K]
     ) -> EBSTMOutput:
-        candidate_A = self.generate_candidates(A_t, agent_feat, agent_mask, oracle_next=oracle_next)
+        candidate_A, cand_mask = self.generate_candidates(A_t, agent_feat, agent_mask, oracle_next=oracle_next)
         B, C, K, _ = candidate_A.shape
 
         pair = self.energy_net(agent_feat, z_mean, z_logvar, agent_mask)  # [B,K,K] pair energies for factual
         # compute energy for each candidate
         energies = []
         for c in range(C):
-            E = self.energy_net.energy_of_structure(pair, candidate_A[:, c])
+            E = self.energy_of_structure(pair, candidate_A[:, c])
             energies.append(E)
         energies = torch.stack(energies, dim=1)  # [B,C]
 
+        # mask out padded candidates
         logits = -energies / float(self.temperature)
+        logits = logits.masked_fill(~cand_mask, -1e9)
         probs = torch.softmax(logits, dim=1)
-        return EBSTMOutput(candidate_A=candidate_A, energies=energies, probs=probs, pair_energies=pair)
+        return EBSTMOutput(candidate_A=candidate_A, candidate_mask=cand_mask, energies=energies, probs=probs, pair_energies=pair)
 
     @staticmethod
     def oracle_index(candidate_A: torch.Tensor, oracle_next: torch.Tensor) -> torch.Tensor:
