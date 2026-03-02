@@ -105,6 +105,36 @@ def _resolve_map_version(map_root: str, map_version: str) -> str:
     # In that case, map_root already points to the version container and map_version should be "".
     return ""
 
+def _build_pool(num_workers: int):
+    """Build a worker/pool compatible across nuplan-devkit versions."""
+    import inspect
+
+    # Most common across nuplan versions/forks
+    try:
+        from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
+    except ImportError:
+        # Some forks/older layouts
+        from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor
+
+    n = int(num_workers)
+
+    # Build kwargs safely across signature variants
+    sig = inspect.signature(SingleMachineParallelExecutor.__init__)
+    params = sig.parameters
+
+    kwargs = {}
+    if "max_workers" in params:
+        kwargs["max_workers"] = n
+    elif "num_workers" in params:
+        kwargs["num_workers"] = n
+
+    # Some versions expose these knobs
+    if "use_process_pool" in params:
+        kwargs["use_process_pool"] = (n > 1)
+    if "use_thread_pool" in params:
+        kwargs["use_thread_pool"] = True
+
+    return SingleMachineParallelExecutor(**kwargs)
 
 
 def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
