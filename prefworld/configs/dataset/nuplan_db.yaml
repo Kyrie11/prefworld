@@ -6,7 +6,7 @@ dataset:
   #   /dataset/val
   #
   # Each folder should contain one or more *.db files.
-  data_root: /coolas-shared/yusz/dataset/nuplan/data/
+  data_root: /coolas-shared/yusz/dataset/nuplan/data/cache
 
   # Your maps directory layout (either of the following is supported):
   #   (A) /maps/nuplan-maps-v1.0/<city>/<version>/map.gpkg
