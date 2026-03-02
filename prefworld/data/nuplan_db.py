@@ -135,7 +135,7 @@ def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilt
                 if int(max_workers) <= 1:
                     pool = SequentialWorkerPool()
                 else:
-                    pool = MultiProcessWorkerPool(num_workers=int(max_workers))
+                    pool = MultiProcessWorkerPool(worker=int(max_workers))
                 with pool:
                     return builder.get_scenarios(scenario_filter, worker_pool=pool)
             except Exception:
