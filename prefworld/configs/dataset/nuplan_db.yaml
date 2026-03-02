@@ -6,7 +6,7 @@ dataset:
   #   /dataset/val
   #
   # Each folder should contain one or more *.db files.
-  data_root: /coolas-shared/yusz/dataset/nuplan/data/preworld
+  data_root: /coolas-shared/yusz/dataset/nuplan/data/
 
   # Your maps directory layout (either of the following is supported):
   #   (A) /maps/nuplan-maps-v1.0/<city>/<version>/map.gpkg
@@ -45,7 +45,7 @@ dataset:
   limit_total_scenarios: null
 
   # Cache output
-  cache_dir: /path/to/cache/prefworld
+  cache_dir: /coolas-shared/yusz/dataset/nuplan/data/preworld
   split: train
 
   # Sampling inside each scenario (iterations)
