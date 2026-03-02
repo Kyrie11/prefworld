@@ -137,65 +137,56 @@ def _build_pool(num_workers: int):
     return SingleMachineParallelExecutor(**kwargs)
 
 
-def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
-    """
-    Call NuPlanScenarioBuilder.get_scenarios with parallelism and skip malformed DBs.
+def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilter, max_workers: int = 4):
+    """Call NuPlanScenarioBuilder.get_scenarios with best-effort parallelism.
+
+    nuPlan devkit versions differ in how worker pools are passed (e.g. `worker`, `worker_pool`,
+    `num_workers`). We inspect the signature and try the compatible call path.
     """
     import inspect
 
-    def _build_pool(num_workers: int):
-        """Build a compatible worker/worker_pool for different nuplan-devkit versions."""
-        import inspect
-
-        # 1) Prefer SingleMachineParallelExecutor (most common across versions)
-        try:
-            from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
-        except ImportError:
-            # some forks put it here
-            from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor
-
-        sig = inspect.signature(SingleMachineParallelExecutor.__init__)
-        params = sig.parameters
-
-        n = int(num_workers)
-        kwargs = {}
-
-        # common arg names across forks/versions
-        if "max_workers" in params:
-            kwargs["max_workers"] = n
-        elif "num_workers" in params:
-            kwargs["num_workers"] = n
-
-        if "use_process_pool" in params:
-            kwargs["use_process_pool"] = (n > 1)
-        if "use_thread_pool" in params:
-            kwargs["use_thread_pool"] = True
-
-        return SingleMachineParallelExecutor(**kwargs)
-
-    # Get signature of get_scenarios
     sig = inspect.signature(builder.get_scenarios)
     params = sig.parameters
 
-    pool = _build_pool(max_workers)
+    # Helper: build a WorkerPool if nuplan provides it
+    def _build_pool(num_workers: int):
+        from nuplan.planning.utils.multithreading.worker_pool import (
+            WorkerPool,
+            SequentialWorkerPool,
+            MultiProcessWorkerPool,
+        )
+        pool: WorkerPool
+        if int(num_workers) <= 1:
+            pool = SequentialWorkerPool()
+        else:
+            pool = MultiProcessWorkerPool(num_workers=int(num_workers))
+        return pool
 
-    def _process_file(local_log_file_absolute_path):
-        """Process a single DB file with error handling for malformed DBs"""
-        try:
-            return get_scenarios_from_db_file(local_log_file_absolute_path)
-        except sqlite3.DatabaseError as e:
-            print(f"[SKIP] malformed db: {local_log_file_absolute_path} error={e}", flush=True)
-            return []  # Skip this DB file and continue
-
+    # 1) Newer devkit: get_scenarios(filter, worker=pool) or get_scenarios(filter, worker)
     if "worker" in params:
-        # Use the worker pool in the get_scenarios call
+        pool = _build_pool(max_workers)
         with pool:
-            scenario_dict = builder.get_scenarios(scenario_filter, worker=pool, process_file=_process_file)
-    else:
-        # Fallback for versions that don't use worker
-        scenario_dict = builder.get_scenarios(scenario_filter)
+            try:
+                return builder.get_scenarios(scenario_filter, worker=pool)
+            except TypeError:
+                # some signatures are positional-only
+                return builder.get_scenarios(scenario_filter, pool)
 
-    return scenario_dict
+    # 2) Older devkit: get_scenarios(filter, worker_pool=pool)
+    if "worker_pool" in params:
+        pool = _build_pool(max_workers)
+        with pool:
+            return builder.get_scenarios(scenario_filter, worker_pool=pool)
+
+    # 3) Keyword-based parallelism in some versions
+    if "num_workers" in params:
+        return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
+    if "num_worker" in params:
+        return builder.get_scenarios(scenario_filter, num_worker=int(max_workers))
+
+    # 4) simplest (no parallelism support)
+    return builder.get_scenarios(scenario_filter)
+
 
 
 @dataclass
