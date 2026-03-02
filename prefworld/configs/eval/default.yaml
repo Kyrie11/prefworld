@@ -1,13 +1,14 @@
 dataset:
-  cache_dir: /path/to/cache/prefworld
+  cache_dir: /path/to/cache/prefworld_val
   split: val
   max_samples: null
 
 model:
   agent_feat_dim: 7
   z_dim: 8
+  tau_dim: 64
   pc_hidden: 64
-  intent_hidden: 128
+  template_hidden: 128
   energy_hidden: 128
   eb_temperature: 1.0
   eb_max_candidates: 64
@@ -16,3 +17,7 @@ eval:
   batch_size: 64
   num_workers: 4
   checkpoint: /path/to/checkpoints/best.pt
+  # If the checkpoint was produced by this repo (>= patched version), it will
+  # contain "model_hparams" so validate.py can instantiate the correct model
+  # automatically, avoiding config/checkpoint mismatches.
+  use_ckpt_hparams: true

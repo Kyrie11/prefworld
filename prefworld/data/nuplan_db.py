@@ -1,55 +1,175 @@
 from __future__ import annotations
 
+import glob
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Sequence, Union
 
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 
-# Worker pools (nuPlan provides both parallel and sequential executors, names may differ across versions).
-try:
-    from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor  # type: ignore
-except Exception:  # pragma: no cover
-    SingleMachineParallelExecutor = None  # type: ignore
+
+PathLike = Union[str, Path]
+DBFilesLike = Union[str, Sequence[str], None]
 
 
-def _make_worker_pool(max_workers: int):
-    if SingleMachineParallelExecutor is None:
-        raise ImportError(
-            "Unable to import nuPlan's SingleMachineParallelExecutor. "
-            "Please check your nuplan-devkit installation."
-        )
+def _as_list(x: DBFilesLike) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        return [str(p) for p in x]
+    return [str(x)]
 
-    # If nuPlan provides a sequential worker pool, prefer it when max_workers <= 1.
-    if max_workers <= 1:
-        try:
-            from nuplan.planning.utils.multithreading.worker_sequential import SequentialWorkerPool  # type: ignore
 
-            return SequentialWorkerPool()
-        except Exception:
-            return SingleMachineParallelExecutor(max_workers=1)
-    return SingleMachineParallelExecutor(max_workers=max_workers)
+def _expand_db_files(data_root: str, db_files: DBFilesLike) -> List[str]:
+    """Resolve db_files into an explicit list of *.db paths.
+
+    Supports:
+      - a single path (file/dir/glob)
+      - a comma-separated string of paths
+      - a list of paths
+      - None: will search under data_root for *.db files (shallow first, then recursive as fallback)
+    """
+    if isinstance(db_files, str) and "," in db_files:
+        items = [p.strip() for p in db_files.split(",") if p.strip()]
+        db_files = items
+
+    items = _as_list(db_files)
+    db_paths: List[str] = []
+
+    def add_from_path(p: str) -> None:
+        if any(ch in p for ch in ["*", "?", "["]):
+            for g in glob.glob(p):
+                add_from_path(g)
+            return
+        if os.path.isdir(p):
+            # Prefer shallow search; fallback to recursive
+            found = list(Path(p).glob("*.db"))
+            if not found:
+                found = list(Path(p).rglob("*.db"))
+            db_paths.extend([str(f) for f in found])
+        elif os.path.isfile(p) and p.endswith(".db"):
+            db_paths.append(p)
+
+    if not items:
+        # Attempt to infer from data_root:
+        # - common layout: /dataset/train_boston/*.db etc.
+        root = Path(data_root)
+        # shallow search up to 2 levels to avoid huge recursion
+        found = list(root.glob("*.db"))
+        if not found:
+            found = list(root.glob("*/*.db"))
+        if not found:
+            found = list(root.rglob("*.db"))
+        db_paths = [str(f) for f in found]
+        return sorted(set(db_paths))
+
+    for p in items:
+        add_from_path(p)
+
+    return sorted(set(db_paths))
+
+
+def _resolve_sensor_root(data_root: str, sensor_root: Optional[str]) -> str:
+    """Try to resolve a reasonable sensor_root; create directory if absent.
+
+    This repo typically uses `include_cameras=False`, so sensor_root is mainly needed because
+    the nuPlan ScenarioBuilder expects a path. An empty directory is acceptable for most use cases.
+    """
+    if sensor_root:
+        os.makedirs(sensor_root, exist_ok=True)
+        return sensor_root
+
+    candidates = [
+        os.path.join(data_root, "sensor_blobs"),
+        os.path.join(os.path.dirname(data_root), "sensor_blobs"),
+        os.path.join(data_root, "sensor_data"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    # fallback: create under data_root
+    fallback = candidates[0]
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def _resolve_map_version(map_root: str, map_version: str) -> str:
+    """If map_root/map_version doesn't exist, fall back to empty version."""
+    if not map_version:
+        return ""
+    if os.path.isdir(os.path.join(map_root, map_version)):
+        return map_version
+    # Many users store maps directly as: /maps/<city>/<version>/map.gpkg
+    # In that case, map_root already points to the version container and map_version should be "".
+    return ""
+
+
+
+def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilter, max_workers: int = 4):
+    """Call NuPlanScenarioBuilder.get_scenarios with best-effort parallelism.
+
+    nuPlan devkit versions differ in how worker pools are passed. We try a few common patterns and
+    fall back to a plain call for maximum compatibility.
+    """
+    # 1) simplest
+    try:
+        return builder.get_scenarios(scenario_filter)
+    except TypeError:
+        pass
+
+    # 2) try a worker_pool kwarg if present
+    try:
+        import inspect
+        sig = inspect.signature(builder.get_scenarios)
+        if "worker_pool" in sig.parameters:
+            # Try to build a sequential / multiprocessing pool if available.
+            try:
+                from nuplan.planning.utils.multithreading.worker_pool import (
+                    WorkerPool,
+                    SequentialWorkerPool,
+                    MultiProcessWorkerPool,
+                )
+                pool: WorkerPool
+                if int(max_workers) <= 1:
+                    pool = SequentialWorkerPool()
+                else:
+                    pool = MultiProcessWorkerPool(num_workers=int(max_workers))
+                with pool:
+                    return builder.get_scenarios(scenario_filter, worker_pool=pool)
+            except Exception:
+                # fallback: call without pool
+                return builder.get_scenarios(scenario_filter)
+    except Exception:
+        pass
+
+    # 3) last resort: try num_workers kwarg
+    try:
+        return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
+    except Exception as e:
+        # If nothing works, re-raise the original error by calling the plain API.
+        return builder.get_scenarios(scenario_filter)
 
 
 @dataclass
 class NuPlanDataConfig:
-    """Configuration to build nuPlan scenarios from DB logs."""
+    """Config for loading nuPlan DB scenarios."""
 
     data_root: str
     map_root: str
     map_version: str = "nuplan-maps-v1.0"
 
-    # Can be None / dir / list / file. If None, builder searches under data_root.
-    db_files: Optional[str] = None
+    # Can be a file, dir, glob, comma-separated string, or list of these.
+    db_files: DBFilesLike = None
 
-    # Not used in this repo (no sensors), but scenario builder requires a sensor_root path.
+    # Optional; if None we'll try to infer.
     sensor_root: Optional[str] = None
 
     include_cameras: bool = False
-    max_workers: int = 8
+    max_workers: int = 4
 
-    # Optional filters
+    # ScenarioFilter fields
     scenario_types: Optional[List[str]] = None
     scenario_tokens: Optional[List[str]] = None
     log_names: Optional[List[str]] = None
@@ -60,54 +180,33 @@ class NuPlanDataConfig:
 
 
 def build_scenarios(cfg: NuPlanDataConfig):
-    """Build nuPlan scenarios from DB logs using the official scenario builder."""
-    sensor_root = cfg.sensor_root or os.path.join(cfg.data_root, "sensor_blobs")
+    """Build a list of nuPlan scenarios according to cfg."""
+    db_list = _expand_db_files(cfg.data_root, cfg.db_files)
+    if len(db_list) == 0:
+        raise FileNotFoundError(
+            f"No .db files found. data_root={cfg.data_root!r}, db_files={cfg.db_files!r}. "
+            f"If your dataset is split into folders like train_boston/train_pittsburgh/val, set db_files to a list of those directories."
+        )
 
+    sensor_root = _resolve_sensor_root(cfg.data_root, cfg.sensor_root)
+
+    map_version = _resolve_map_version(cfg.map_root, cfg.map_version)
     builder = NuPlanScenarioBuilder(
-        data_root=cfg.data_root,
-        map_root=cfg.map_root,
-        sensor_root=sensor_root,
-        db_files=cfg.db_files,
-        map_version=cfg.map_version,
-        include_cameras=cfg.include_cameras,
-        max_workers=cfg.max_workers,
-        verbose=True,
+        data_root=str(cfg.data_root),
+        map_root=str(cfg.map_root),
+        db_files=db_list,
+        sensor_root=str(sensor_root),
+        map_version=str(map_version),
+        include_cameras=bool(cfg.include_cameras),
     )
 
-    
-    # Build ScenarioFilter with best-effort compatibility across nuplan-devkit versions.
-    # We only pass arguments that exist in the installed ScenarioFilter __init__ signature.
-    sf_kwargs = dict(
+    scenario_filter = ScenarioFilter(
         scenario_types=cfg.scenario_types,
         scenario_tokens=cfg.scenario_tokens,
         log_names=cfg.log_names,
-        map_names=None,
         shuffle=cfg.shuffle,
         expand_scenarios=cfg.expand_scenarios,
-        remove_invalid_goals=True,
         num_scenarios_per_type=cfg.num_scenarios_per_type,
         limit_total_scenarios=cfg.limit_total_scenarios,
-        # Optional advanced filters (leave None by default)
-        timestamp_threshold_s=None,
-        ego_displacement_minimum_m=None,
-        ego_start_speed_threshold=None,
-        ego_stop_speed_threshold=None,
-        speed_noise_tolerance=None,
-        token_set_path=None,
-        fraction_in_token_set_threshold=None,
-        ego_route_radius=None,
     )
-
-    import inspect
-
-    sig = inspect.signature(ScenarioFilter.__init__)
-    valid_keys = set(sig.parameters.keys())
-    # remove 'self'
-    valid_keys.discard('self')
-    sf_kwargs = {k: v for k, v in sf_kwargs.items() if k in valid_keys}
-
-    scenario_filter = ScenarioFilter(**sf_kwargs)
-
-    worker = _make_worker_pool(cfg.max_workers)
-    scenarios = builder.get_scenarios(scenario_filter, worker)
-    return scenarios
+    return _get_scenarios(builder, scenario_filter, max_workers=cfg.max_workers)

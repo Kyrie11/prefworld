@@ -1,35 +1,51 @@
+seed: 0
+device: cuda
+
 dataset:
-  cache_dir: /path/to/cache/prefworld
-  train_split: train
-  val_split: val
-  max_train_samples: null
-  max_val_samples: null
+  cache_dir: /path/to/cache/prefworld_train
+  split: train
+  max_samples: null
+
+eval:
+  # Validation cache (set this to your val cache directory)
+  cache_dir: /path/to/cache/prefworld_val
+  batch_size: 64
+  num_workers: 4
+  max_batches: 200
 
 model:
   agent_feat_dim: 7
   z_dim: 8
+  tau_dim: 64
   pc_hidden: 64
-  intent_hidden: 128
+  template_hidden: 128
   energy_hidden: 128
   eb_temperature: 1.0
   eb_max_candidates: 64
 
+optim:
+  lr: 1e-3
+  weight_decay: 1e-4
+
 train:
-  output_dir: ./outputs/run1
-  seed: 42
-  batch_size: 32
+  output_dir: outputs
+  batch_size: 16
   num_workers: 4
   max_epochs: 20
   grad_clip_norm: 5.0
+
+  # Preference completion query drop ratio (0 => use full evidence; >0 => random context/query split)
   pc_drop_prob: 0.2
 
   # Loss weights
   w_pc: 1.0
-  w_kl: 0.1
-  w_intent: 1.0
   w_eb: 1.0
 
-optim:
-  lr: 1.0e-3
-  weight_decay: 1.0e-4
-  betas: [0.9, 0.999]
+  # Maneuver is latent by default (unlabeled); set >0 to enable weak supervision from heuristic labels
+  w_intent: 0.0
+
+  # Weight for PC KL terms (KL(q_full||q_ctx) and KL(q_ctx||prior))
+  w_kl: 0.1
+
+  log_interval: 20
+  val_interval: 200

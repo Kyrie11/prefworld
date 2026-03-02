@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from prefworld.data.dataset import CachedNuPlanDataset, collate_batch
 from prefworld.models.prefworld_model import PrefWorldModel
-from prefworld.training.trainer import evaluate
+from prefworld.training.trainer import TrainConfig, evaluate
 from prefworld.training.utils import load_checkpoint
 from prefworld.utils.config import load_config, make_argparser, parse_overrides
 
@@ -36,9 +36,37 @@ def main() -> None:
         drop_last=False,
     )
 
-    model = PrefWorldModel(**cfg.model).to(device)
-    load_checkpoint(str(cfg.eval.checkpoint), model)
-    stats = evaluate(model, loader, device)
+    # ------------------------------------------------------------------
+    # Robust checkpoint loading
+    #
+    # Bug-fix: evaluation configs may not match the training-time model
+    # hyper-parameters (e.g. pc_hidden). New checkpoints store model_hparams
+    # so we can re-instantiate the correct architecture automatically.
+    # ------------------------------------------------------------------
+    ckpt_path = str(cfg.eval.checkpoint)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    use_ckpt_hparams = bool(getattr(cfg.eval, "use_ckpt_hparams", True))
+    if use_ckpt_hparams and isinstance(ckpt, dict) and "model_hparams" in ckpt:
+        model_kwargs = dict(ckpt["model_hparams"])
+        print("Instantiating model from checkpoint hparams.")
+    else:
+        model_kwargs = dict(cfg.model)
+
+    model = PrefWorldModel(**model_kwargs).to(device)
+    load_checkpoint(ckpt_path, model)
+
+    # validate.py uses the trainer's evaluation loop; provide a minimal TrainConfig so
+    # PC query NLL (and any EB regularizers) are computed consistently.
+    train_cfg = TrainConfig(
+        output_dir=str(cfg.dataset.cache_dir),
+        pc_split_mode=str(getattr(cfg.eval, "pc_split_mode", "random")),
+        pc_query_ratio=float(getattr(cfg.eval, "pc_query_ratio", 0.3)),
+        lambda_con=float(getattr(cfg.eval, "lambda_con", 0.0)),
+        eb_smooth_scale=float(getattr(cfg.eval, "lambda_smooth", 0.0)),
+        eb_phys_penalty_scale=float(getattr(cfg.eval, "lambda_phys", 0.0)),
+    )
+    stats = evaluate(model, loader, device, train_cfg)
     print("Validation results:")
     for k, v in stats.items():
         print(f"  {k}: {v:.6f}")

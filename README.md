@@ -1,134 +1,144 @@
-# PrefWorld (PyTorch) — nuPlan DBs + HD Map (No Sensors)
+# PrefWorld (ICLR 2026 submission repo)
 
-This repository implements a **preference-conditioned structured world model** designed for:
-- **Training** on nuPlan DB logs (SQLite `.db`) and HD maps (nuplan-maps-v1.0)
-- **Validation** on held-out logs/scenarios
-- **No raw sensor input** (no images / point clouds)
+This repo contains a *world model* for multi-agent driving scenes on **nuPlan**:
 
-It provides:
-- Streaming **Preference Completion** (Gaussian belief update in natural-parameter form)
-- **Intention (maneuver) prediction** conditioned on preferences and ego candidate plan
-- **EB-STM** (Energy-Based Structured Transition Model) over discrete interaction structures
-- **PCI** (Preference Criticality Index) for selecting critical agents (information-value based)
+- **Preference completion**: infer latent per-agent preferences from partial observations.
+- **EB-STM**: energy-based structured transition model for interaction graphs.
+- **PCI**: identify preference-critical agents via counterfactual rollout divergence.
+- **(Optional) planner**: structure sampling + risk aggregation + MPC-style tracking.
 
-> ⚠️ This repo depends on `nuplan-devkit` for reading DB logs and maps. Install nuPlan first.
-
----
-
-## 1) Installation
-
-### 1.1 Install nuPlan devkit (recommended: from source)
-```bash
-git clone https://github.com/motional/nuplan-devkit.git
-cd nuplan-devkit
-git checkout v1.2
-pip install -e .
-```
-
-### 1.2 Install this repo
-```bash
-cd prefworld
-pip install -e .
-```
+Key implementation updates in this version:
+- Preference completion uses an **autoregressive motion-primitive likelihood** (maneuver is treated as a *latent*; no maneuver labels required for training).
+- EB-STM supports **templateized edit-token candidates**, **beam rollout**, and **predictability-adaptive horizon** (entropy-based early stop).
+- PCI is implemented with **shared rollout support** + **counterfactual reweighting** and includes a **risk tie-break** (CVaR-style interaction frequency with ego).
 
 ---
 
-## 2) Data Layout
+## 1) Environment
 
-We assume nuPlan v1.1 dataset layout similar to the official devkit docs. A typical layout:
-```
-NUPLAN_DATA_ROOT/
-  nuplan-v1.1/
-    splits/
-      train/   (db files)
-      val/
-      test/
-    maps/
-      nuplan-maps-v1.0/
-        <city>/
-          map.gpkg
-```
+- Python 3.10+
+- PyTorch 2.x
+- nuPlan devkit (for scenario reading / map access)
 
-You will need:
-- `data_root`: directory containing the `.db` logs (or a directory that contains split subdirs)
-- `map_root`: directory containing `nuplan-maps-v1.0/`
+> Note: the dev container used for code review may not include the nuPlan devkit. Runtime usage requires installing nuPlan on your machine.
 
 ---
 
-## 3) Preprocessing (cache features/labels)
+## 2) Dataset layout (your structure)
 
-We recommend caching samples to disk for fast training.
+This repo now supports the following layout directly:
 
-```bash
-python -m prefworld.scripts.prepare_dataset \
-  --config prefworld/configs/dataset/nuplan_db.yaml \
-  dataset.data_root=/path/to/nuplan-v1.1/splits/train \
-  dataset.map_root=/path/to/nuplan-v1.1/maps \
-  dataset.cache_dir=/path/to/cache/prefworld \
-  dataset.split=train
+**DBs**
+```
+/dataset/train_boston
+/dataset/train_pittsburgh
+/dataset/train_singapore
+/dataset/val
+```
+Each folder should contain one or more `*.db` files.
 
-python -m prefworld.scripts.prepare_dataset \
-  --config prefworld/configs/dataset/nuplan_db.yaml \
-  dataset.data_root=/path/to/nuplan-v1.1/splits/val \
-  dataset.map_root=/path/to/nuplan-v1.1/maps \
-  dataset.cache_dir=/path/to/cache/prefworld \
-  dataset.split=val
+**Maps**
+Either of these layouts is supported:
+- (A) Official nuPlan layout:
+  ```
+  /maps/nuplan-maps-v1.0/<city>/<version>/map.gpkg
+  ```
+- (B) Flat layout (no `nuplan-maps-v1.0` folder):
+  ```
+  /maps/<city>/<version>/map.gpkg
+  ```
+Your example looks like (B), e.g.:
+```
+/maps/sg-one-north/9.17.1964/map.gpkg   # (or map.pkg if that’s how your export is named)
 ```
 
-This will create:
-```
-cache_dir/
-  train/
-    index.jsonl
-    samples/
-      <log>__<scenario_token>__itXXXX.npz
-  val/
-    index.jsonl
-    samples/
-      ...
-```
+If you use layout (B), set:
+- `dataset.map_root: /maps`
+- `dataset.map_version: ""` (empty)
 
 ---
 
-## 4) Training
+## 3) Build cache
+
+Edit `prefworld/configs/dataset/nuplan_db.yaml` and set:
+- `dataset.data_root`
+- `dataset.db_files` (a list of train/val directories)
+- `dataset.map_root`
+- `dataset.map_version`
+
+Then build cached training samples:
 
 ```bash
-python -m prefworld.scripts.train \
-  --config prefworld/configs/train/default.yaml \
-  dataset.cache_dir=/path/to/cache/prefworld \
-  train.output_dir=/path/to/outputs/run1
+python -m prefworld.scripts.prepare_dataset   --config prefworld/configs/dataset/nuplan_db.yaml   dataset.split=train   dataset.cache_dir=/path/to/cache/prefworld_train
 ```
 
-Checkpoint will be saved under `output_dir/checkpoints/`.
-
----
-
-## 5) Validation
+Build cached validation samples:
 
 ```bash
-python -m prefworld.scripts.validate \
-  --config prefworld/configs/eval/default.yaml \
-  dataset.cache_dir=/path/to/cache/prefworld \
-  eval.checkpoint=/path/to/outputs/run1/checkpoints/best.pt
+python -m prefworld.scripts.prepare_dataset   --config prefworld/configs/dataset/nuplan_db.yaml   dataset.split=val   dataset.db_files=[/dataset/val]   dataset.cache_dir=/path/to/cache/prefworld_val
 ```
 
 ---
 
-## 6) Notes / Design choices
+## 4) Train
 
-- **No sensors**: We use only ego + tracked objects + traffic lights from DBs and HD maps.
-- **Pseudo-labels**:
-  - Maneuver labels are computed from future kinematics (lane-change/turn/stop heuristics).
-  - Interaction structure labels are computed from conflict-region overlap and temporal ordering.
-- You can improve labels using more advanced map-aware logic; the code is modular for that.
+```bash
+python -m prefworld.scripts.train   --config prefworld/configs/train/default.yaml   dataset.cache_dir=/path/to/cache/prefworld_train   train.val_cache_dir=/path/to/cache/prefworld_val   train.output_dir=/path/to/outputs/run1
+```
+
+Important training knobs:
+- `train.w_pc`: weight for preference completion objective
+- `train.w_kl`: **used** as the weight for PC KL terms (both KL(q_full||q_ctx) and KL(q_ctx||prior))
+- `train.w_intent`: default `0.0` (maneuver is latent / unlabeled).  
+  If you want to use heuristic pseudo-labels as weak supervision, enable:
+  - `model.use_pseudo_intent=true`
+  - `train.w_intent>0`
 
 ---
 
-## 7) Directory structure
+## 5) Validate
+
+```bash
+python -m prefworld.scripts.validate   --config prefworld/configs/eval/default.yaml   dataset.cache_dir=/path/to/cache/prefworld_val   eval.checkpoint=/path/to/outputs/run1/checkpoints/best.pt
+```
+
+---
+
+## 6) PCI (Preference-Critical Agents)
+
+The PCI implementation lives in:
+- `prefworld/planning/pci.py`
+
+It computes PCI using:
+- shared structure rollouts `R_1..R_S` under the full belief
+- counterfactual reweighting per agent
+- Jensen–Shannon divergence between rollout distributions
+- optional tie-break risk (CVaR of ego↔agent interaction count)
+
+You can also select agents with the risk tie-break in:
+- `prefworld/planning/critical_agents.py`
+
+---
+
+## 7) Planner (structure sampling + risk + MPC)
+
+A lightweight planner is provided in:
+- `prefworld/planning/planner.py`
+
+It demonstrates the paper’s logic flow:
+1) condition on ego maneuver
+2) sample / beam-rollout interaction structures
+3) score candidate maneuvers by a risk metric (expected + CVaR)
+4) track the chosen reference with a simple gradient-based MPC
+
+This is intentionally minimal and is meant as an integration scaffold.
+
+---
+
+## 8) Repo structure
 
 - `prefworld/data/` — nuPlan DB reading, feature extraction, caching
-- `prefworld/models/` — PCNet, IntentionNet, EFEN, EB-STM, combined model
-- `prefworld/planning/` — PCI and (optional) inference utilities
-- `prefworld/training/` — losses, metrics, training loops
+- `prefworld/models/` — template encoder, preference completion, EFEN, EB-STM, full model
+- `prefworld/planning/` — PCI, critical agent selection, (optional) planner + MPC
+- `prefworld/training/` — training loops
 - `prefworld/scripts/` — CLI entrypoints
-

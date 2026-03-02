@@ -1,0 +1,53 @@
+seed: 0
+device: cuda
+
+# Cached samples OR cached episodes. Stage-1 uses only preference completion.
+dataset:
+  cache_dir: /path/to/cache/prefworld_train
+  split: train
+  kind: samples          # samples | episodes
+  max_samples: null
+
+  # For samples: use the full (past) token sequence as the episode.
+  # For episodes: you can store long per-agent sequences.
+
+model:
+  agent_feat_dim: 7
+  z_dim: 8
+  tau_dim: 64
+  pc_hidden: 128
+  template_hidden: 128
+  energy_hidden: 128
+  eb_temperature: 1.0
+  eb_max_candidates: 64
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+
+train:
+  output_dir: outputs_stage1_pc
+  batch_size: 16
+  num_workers: 4
+  max_epochs: 20
+  grad_clip_norm: 5.0
+
+  # --- Preference completion episode construction (paper Sec. 4) ---
+  pc_episode_mix_prefix_prob: 0.5      # P(prefix episode) vs P(cross-template episode)
+  pc_query_ratio: 0.3
+  pc_cross_template_topk_frac: 0.5     # fraction of queries chosen from most-novel candidates
+  pc_cross_template_warmup_epochs: 1
+
+  # --- Preference completion loss weights (Eq. 18) ---
+  lambda_distill_mu: 1.0
+  lambda_distill_cov: 0.05
+  lambda_prior: 0.1
+  lambda_con: 0.05
+  lambda_overlap: 1.0e-3
+  lambda_mod: 1.0e-3
+
+  n_z_samples: 1
+  free_bits: 0.0
+
+  log_interval: 20
+  val_interval: 0

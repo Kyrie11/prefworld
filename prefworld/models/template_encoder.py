@@ -9,10 +9,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
-    """Softmax with a boolean mask (True=keep)."""
-    logits = logits.masked_fill(~mask, -1e9)
-    return torch.softmax(logits, dim=dim)
+def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int, eps: float = 1e-9) -> torch.Tensor:
+    """Softmax with a boolean mask (True=keep).
+
+    Bug-fix: when *all* entries are masked out along `dim`, plain softmax would return a uniform
+    distribution (or NaNs depending on the implementation). We instead return all-zeros for that slice.
+    """
+    m = mask.to(dtype=torch.bool)
+    logits = logits.masked_fill(~m, -1e9)
+    probs = torch.softmax(logits, dim=dim)
+    probs = probs * m.to(dtype=probs.dtype)
+    denom = probs.sum(dim=dim, keepdim=True).clamp_min(eps)
+    return probs / denom
 
 
 @dataclass
@@ -22,6 +30,15 @@ class TemplateEncoding:
     tau: torch.Tensor          # [B,N,T,D]
     map_context: torch.Tensor  # [B,N,T,Dm]
     nbr_context: torch.Tensor  # [B,N,T,Da]
+
+    # --- Structured template components (paper-aligned) ---
+    # These are optional and may be ignored by downstream modules.
+    neighbor_mask: Optional[torch.Tensor] = None        # [B,N,T,N] bool
+    feasible_actions: Optional[torch.Tensor] = None     # [B,N,T,M] bool
+    kinematic_limits: Optional[torch.Tensor] = None     # [B,N,T,3] (max_acc, max_speed, max_curv)
+    conflict_mask: Optional[torch.Tensor] = None        # [B,N,T,N] bool
+    conflict_region_id: Optional[torch.Tensor] = None   # [B,N,T,N] int
+    map_attn: Optional[torch.Tensor] = None             # [B,N,T,M_map] float
 
 
 class MapPolylineNodeEncoder(nn.Module):
@@ -193,8 +210,10 @@ class TemplateEncoder(nn.Module):
         # Pairwise relative geometry
         pos = a_feat[..., 0:2]  # [B,N,T,2]
         vel = a_feat[..., 3:5]  # [B,N,T,2]
-        rel_pos = pos.unsqueeze(2) - pos.unsqueeze(1)  # [B,N,N,T,2] (j - i) if we swap, but symmetric for dist
-        rel_vel = vel.unsqueeze(2) - vel.unsqueeze(1)  # [B,N,N,T,2]
+        # NOTE (bug-fix): keep the (i, j) convention consistent across the encoder.
+        # We use rel_pos = p_j - p_i and rel_vel = v_j - v_i.
+        rel_pos = pos.unsqueeze(1) - pos.unsqueeze(2)  # [B,N,N,T,2] = p_j - p_i
+        rel_vel = vel.unsqueeze(1) - vel.unsqueeze(2)  # [B,N,N,T,2] = v_j - v_i
         rel_pos = rel_pos.permute(0, 1, 3, 2, 4)  # [B,N,T,N,2] where last N is neighbor j
         rel_vel = rel_vel.permute(0, 1, 3, 2, 4)  # [B,N,T,N,2]
         dist_ij = torch.norm(rel_pos, dim=-1, keepdim=True)  # [B,N,T,N,1]
@@ -223,4 +242,86 @@ class TemplateEncoder(nn.Module):
         # final τ embedding
         tau = self.tau_out(torch.cat([a_emb, map_ctx, nbr_ctx], dim=-1))
         tau = tau * a_mask.unsqueeze(-1).to(dtype=tau.dtype)
-        return TemplateEncoding(tau=tau, map_context=map_ctx, nbr_context=nbr_ctx)
+
+        # ------------------------------------------------------------------
+        # Structured template outputs (neighbors, feasible actions, constraints)
+        # ------------------------------------------------------------------
+        # Conflict region proxy: constant-velocity closest-approach within horizon.
+        horizon_s = 3.0
+        eps = 1e-6
+        pos = a_feat[..., 0:2]
+        vel = a_feat[..., 3:5]
+        # r = p_j - p_i, v = v_j - v_i
+        r = (pos.unsqueeze(1) - pos.unsqueeze(2)).permute(0, 1, 3, 2, 4)  # [B,N,T,N,2]
+        v = (vel.unsqueeze(1) - vel.unsqueeze(2)).permute(0, 1, 3, 2, 4)  # [B,N,T,N,2]
+        rv = (r * v).sum(dim=-1)                  # [B,N,T,N]
+        vv = (v * v).sum(dim=-1).clamp_min(eps)   # [B,N,T,N]
+        t_star = (-rv / vv).clamp(min=0.0, max=horizon_s)
+        closest = r + v * t_star.unsqueeze(-1)
+        d2 = (closest * closest).sum(dim=-1)      # [B,N,T,N]
+        # threshold: radius-based (rough proxy). Since we don't have per-agent radii here, use constant.
+        d0 = 4.0
+        conflict = d2 < (d0 * d0)
+
+        # Mask invalid pairs
+        valid_j = a_mask.unsqueeze(1).expand(B, N, N, T).permute(0, 1, 3, 2)
+        valid_i = a_mask.unsqueeze(-1).expand(B, N, T, N)
+        eye = torch.eye(N, device=agents_state.device, dtype=torch.bool).unsqueeze(0).unsqueeze(2)
+        not_self = ~eye.expand(B, N, T, N)
+        conflict_mask = conflict & valid_i & valid_j & not_self
+        conflict_region_id = conflict_mask.to(torch.int64)
+
+        # Feasible actions proxy using map polyline types and nearby lane offsets.
+        M_actions = 6  # keep, LCL, LCR, TL, TR, stop (matches labels.NUM_MANEUVERS)
+        feasible = torch.ones((B, N, T, M_actions), device=agents_state.device, dtype=torch.bool)
+        if map_poly_type is None:
+            map_poly_type = torch.zeros((B, map_polylines.shape[1]), device=agents_state.device, dtype=torch.long)
+        poly_type = map_poly_type.long()
+        is_lane = poly_type == 0
+        is_conn = poly_type == 1
+        # relative position of lane centers in agent heading frame
+        yaw = a_feat[..., 2]
+        relc = map_center.unsqueeze(1).unsqueeze(1) - agent_pos.unsqueeze(3)  # [B,N,T,M,2]
+        rel_s, rel_d = self._rotate_to_heading(relc[..., 0], relc[..., 1], yaw.unsqueeze(-1))
+        # lanes roughly ahead and parallel proxy: |rel_d| indicates left/right adjacent lanes
+        lane_ok = is_lane.unsqueeze(1).unsqueeze(1) & score_mask
+        left_ok = lane_ok & (rel_s > 0.0) & (rel_d > 1.5) & (rel_d < 8.0)
+        right_ok = lane_ok & (rel_s > 0.0) & (rel_d < -1.5) & (rel_d > -8.0)
+        feasible[..., 1] = left_ok.any(dim=-1)
+        feasible[..., 2] = right_ok.any(dim=-1)
+
+        # turns: presence of lane connector ahead.
+        conn_ok = is_conn.unsqueeze(1).unsqueeze(1) & score_mask & (rel_s > 0.0) & (rel_s < 25.0) & (rel_d.abs() < 15.0)
+        feasible[..., 3] = conn_ok.any(dim=-1)  # left turn (coarse)
+        feasible[..., 4] = conn_ok.any(dim=-1)  # right turn (coarse)
+
+        # Kinematic limits (simple constants; could be made speed-dependent)
+        max_acc = torch.full((B, N, T, 1), 3.0, device=agents_state.device, dtype=tau.dtype)
+        speed = torch.norm(a_feat[..., 3:5], dim=-1, keepdim=True)
+        max_speed = torch.clamp(speed + 10.0, min=5.0, max=30.0)
+        max_curv = torch.full((B, N, T, 1), 0.2, device=agents_state.device, dtype=tau.dtype)
+        kin_limits = torch.cat([max_acc, max_speed, max_curv], dim=-1) * a_mask.unsqueeze(-1).to(tau.dtype)
+
+        return TemplateEncoding(
+            tau=tau,
+            map_context=map_ctx,
+            nbr_context=nbr_ctx,
+            neighbor_mask=nbr_mask,
+            feasible_actions=feasible,
+            kinematic_limits=kin_limits,
+            conflict_mask=conflict_mask,
+            conflict_region_id=conflict_region_id,
+            map_attn=attn,
+        )
+
+    @staticmethod
+    def _rotate_to_heading(x: torch.Tensor, y: torch.Tensor, yaw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rotate (x,y) in ego frame into heading frame (forward,left).
+
+        yaw can be broadcastable to x/y.
+        """
+        cy = torch.cos(yaw)
+        sy = torch.sin(yaw)
+        s = cy * x + sy * y
+        d = -sy * x + cy * y
+        return s, d

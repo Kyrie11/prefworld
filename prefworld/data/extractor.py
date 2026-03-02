@@ -297,6 +297,7 @@ def _compute_structure_from_futures(
     """
     K, T, _ = traj_xy.shape
     A = np.zeros((K, K), dtype=np.int64)
+    score = np.zeros((K, K), dtype=np.float32)  # confidence proxy for cycle breaking
     for i in range(K):
         if not valid_mask[i]:
             continue
@@ -328,11 +329,85 @@ def _compute_structure_from_futures(
             if ti < tj:
                 # j yields to i
                 A[j, i] = 1
+                score[j, i] = float(abs(tj - ti))
             elif tj < ti:
                 A[i, j] = 1
+                score[i, j] = float(abs(ti - tj))
             else:
                 # tie: ignore
                 pass
+
+    # Enforce DAG (paper assumes acyclic precedence). Remove the weakest edge in each detected cycle.
+    A = _enforce_acyclic(A, valid_mask=valid_mask, edge_score=score)
+    return A
+
+
+def _find_cycle_edges(A: np.ndarray, valid_mask: np.ndarray) -> Optional[list[tuple[int, int]]]:
+    """Return a list of directed edges (u,v) that form a cycle, or None if acyclic."""
+    K = A.shape[0]
+    valid = (valid_mask > 0.5)
+    state = np.zeros((K,), dtype=np.int8)  # 0=unvisited,1=visiting,2=done
+    parent = -np.ones((K,), dtype=np.int32)
+
+    def dfs(u: int) -> Optional[list[tuple[int, int]]]:
+        state[u] = 1
+        for v in range(K):
+            if not valid[v] or A[u, v] == 0:
+                continue
+            if state[v] == 0:
+                parent[v] = u
+                cyc = dfs(v)
+                if cyc is not None:
+                    return cyc
+            elif state[v] == 1:
+                # found back-edge u->v, reconstruct cycle edges
+                edges: list[tuple[int, int]] = [(u, v)]
+                cur = u
+                while cur != v and cur != -1:
+                    p = int(parent[cur])
+                    if p == -1:
+                        break
+                    edges.append((p, cur))
+                    cur = p
+                return edges
+        state[u] = 2
+        return None
+
+    for s in range(K):
+        if not valid[s] or state[s] != 0:
+            continue
+        cyc = dfs(int(s))
+        if cyc is not None:
+            return cyc
+    return None
+
+
+def _enforce_acyclic(A: np.ndarray, *, valid_mask: np.ndarray, edge_score: Optional[np.ndarray] = None) -> np.ndarray:
+    """Greedily remove edges until the directed graph is acyclic."""
+    A = A.copy().astype(np.int64)
+    if edge_score is None:
+        edge_score = np.ones_like(A, dtype=np.float32)
+    else:
+        edge_score = edge_score.astype(np.float32)
+
+    while True:
+        cyc = _find_cycle_edges(A, valid_mask)
+        if cyc is None:
+            break
+        # remove weakest edge in the cycle
+        weakest = None
+        weakest_s = float("inf")
+        for (u, v) in cyc:
+            s = float(edge_score[u, v])
+            if s < weakest_s:
+                weakest_s = s
+                weakest = (u, v)
+        if weakest is None:
+            # fallback
+            u, v = cyc[0]
+        else:
+            u, v = weakest
+        A[u, v] = 0
     return A
 
 
@@ -497,6 +572,26 @@ def extract_sample(
                 traj_xy[1 + i, 1:] = agents_future[i, :, :2]
     structure_t = _compute_structure_from_futures(traj_xy, valid, cfg)
 
+    # Rule-based structure at t (NO future leakage): constant-velocity rollout from current state.
+    # This is intended for online planning / evaluation.
+    dt_fut = float(cfg.future_horizon_s) / max(1, int(cfg.future_num_samples))
+    horizon_rule = min(3.0, float(cfg.future_horizon_s))
+    T_rule = int(round(horizon_rule / max(1e-3, dt_fut))) + 1
+    traj_xy_rule = np.zeros((K, T_rule, 2), dtype=np.float32)
+    vel_rule = np.zeros((K, 2), dtype=np.float32)
+    traj_xy_rule[0, 0] = np.array([0.0, 0.0], dtype=np.float32)
+    # ego velocity in ego-local frame (vx,vy)
+    ego_vel_local = global_to_local_xy(ego_vec[4:6][None, :], np.zeros(2, dtype=np.float32), ego_yaw)[0]
+    vel_rule[0] = ego_vel_local
+    for i in range(cfg.max_agents):
+        if valid[1 + i] > 0.5:
+            traj_xy_rule[1 + i, 0] = agents_curr[i, 0:2]
+            vel_rule[1 + i] = agents_curr[i, 3:5]
+    for t in range(1, T_rule):
+        tt = float(t) * dt_fut
+        traj_xy_rule[:, t] = traj_xy_rule[:, 0] + vel_rule * tt
+    structure_t_rule = _compute_structure_from_futures(traj_xy_rule, valid, cfg)
+
     # Structure at t + delta
     # nuPlan scenario interval (seconds)
     db_dt = getattr(scenario, "database_interval", None)
@@ -597,6 +692,7 @@ def extract_sample(
         # Structure labels
         "structure_t": structure_t,  # [1+Nmax,1+Nmax]
         "structure_t1": structure_t1,
+        "structure_t_rule": structure_t_rule,
         # Map
         "map_polylines": map_feat["map_polylines"].astype(np.float32),
         "map_poly_mask": map_feat["map_poly_mask"].astype(np.float32),

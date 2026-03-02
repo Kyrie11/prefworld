@@ -1,63 +1,217 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prefworld.models.efen import EditFactorizedEnergyNet, PairEnergies
+from prefworld.models.efen_edit import EditFactorizedEnergyNetEdit, EditTokenEnergies
 
 
 @dataclass
 class EBSTMOutput:
     """Output of a one-step EB-STM transition."""
 
-    candidate_A: torch.Tensor   # [B,C,K,K]
-    candidate_mask: torch.Tensor  # [B,C] bool
-    energies: torch.Tensor      # [B,C]
-    probs: torch.Tensor         # [B,C]
-    pair_energies: PairEnergies # pair energies for the factual belief (for reweighting)
+    candidate_A: torch.Tensor        # [B,C,K,K]
+    candidate_mask: torch.Tensor     # [B,C] bool
+    energies: torch.Tensor           # [B,C]
+    probs: torch.Tensor              # [B,C]
+    edit_tokens: torch.Tensor         # [B,C,4] (i,j,prev_state,next_state)
+    pair_energies: EditTokenEnergies  # factual pair edit-energies for reuse/debug
 
 
 def _unique_adjacency(candidates: List[torch.Tensor]) -> List[torch.Tensor]:
     """Remove duplicates adjacency matrices (by exact equality)."""
     uniq: List[torch.Tensor] = []
     for A in candidates:
-        found = False
-        for U in uniq:
-            if torch.equal(A, U):
-                found = True
-                break
-        if not found:
+        if not any(torch.equal(A, U) for U in uniq):
             uniq.append(A)
     return uniq
 
 
 class EBSTM(nn.Module):
-    """Energy-Based Structured Transition Model (one-step + optional rollout)."""
+    """Energy-Based Structured Transition Model (EB-STM).
+
+    Implemented features:
+      - Candidate generation via *templateized edit tokens* (single-edge add/delete/flip).
+      - Energy evaluation via EFEN token energies (already includes preference uncertainty penalty).
+      - Vectorized candidate energy computation (faster + less bug-prone).
+      - Rollout sampling and **beam rollout**.
+      - Predictability-adaptive horizon stopping (entropy threshold).
+      - Optional extra structure-level preference-uncertainty penalty (can be enabled via scale>0).
+    """
 
     def __init__(
         self,
-        energy_net: EditFactorizedEnergyNet,
+        energy_net: EditFactorizedEnergyNetEdit,
         temperature: float = 1.0,
         max_candidates: int = 64,
         edit_dist_threshold: float = 30.0,
+        enforce_acyclic: bool = True,
+        # Candidate-pair expansion beyond a fixed distance threshold.
+        # This approximates map/interaction-region semantics by using a constant-velocity
+        # closest-approach check. It helps include pairs that are currently farther apart
+        # but on a collision course.
+        conflict_horizon_s: float = 3.0,
+        conflict_dist_threshold: float = 6.0,
+        use_closest_approach_candidates: bool = True,
+        # Additional uncertainty penalty at the *structure* level (0 disables; EFEN already includes one).
+        uncertainty_penalty_scale: float = 0.0,
     ):
         super().__init__()
         self.energy_net = energy_net
-        self.temperature = temperature
-        self.max_candidates = max_candidates
-        self.edit_dist_threshold = edit_dist_threshold
+        self.temperature = float(temperature)
+        self.max_candidates = int(max_candidates)
+        self.edit_dist_threshold = float(edit_dist_threshold)
+        self.enforce_acyclic = bool(enforce_acyclic)
+        self.conflict_horizon_s = float(conflict_horizon_s)
+        self.conflict_dist_threshold = float(conflict_dist_threshold)
+        self.use_closest_approach_candidates = bool(use_closest_approach_candidates)
+        self.uncertainty_penalty_scale = float(uncertainty_penalty_scale)
+
+
+    @staticmethod
+    def extract_edit_tokens(A_t: torch.Tensor, candidate_A: torch.Tensor) -> torch.Tensor:
+        """Extract a compact edit token (i,j,prev_state,next_state) for each candidate.
+
+        States are 3-way for each unordered pair (i<j):
+          0: NONE
+          1: i -> j
+          2: j -> i
+
+        This is primarily for debugging / interpretability.
+        """
+        B, C, K, _ = candidate_A.shape
+        tokens = torch.zeros((B, C, 4), device=candidate_A.device, dtype=torch.int64)
+        for b in range(B):
+            base = A_t[b]
+            for c in range(C):
+                cand = candidate_A[b, c]
+                if torch.equal(cand, base):
+                    continue
+                found = False
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        if cand[i, j] != base[i, j] or cand[j, i] != base[j, i]:
+                            # prev / next states
+                            prev = 0
+                            if base[i, j] > 0.5 and base[j, i] < 0.5:
+                                prev = 1
+                            elif base[j, i] > 0.5 and base[i, j] < 0.5:
+                                prev = 2
+
+                            nxt = 0
+                            if cand[i, j] > 0.5 and cand[j, i] < 0.5:
+                                nxt = 1
+                            elif cand[j, i] > 0.5 and cand[i, j] < 0.5:
+                                nxt = 2
+
+                            tokens[b, c, 0] = i
+                            tokens[b, c, 1] = j
+                            tokens[b, c, 2] = prev
+                            tokens[b, c, 3] = nxt
+                            found = True
+                            break
+                    if found:
+                        break
+        return tokens
+
+    @staticmethod
+    def _relation_state3(A: torch.Tensor) -> torch.Tensor:
+        """3-state relation encoding for each ordered pair slot.
+
+        For each (i,j):
+          0: none, 1: i->j, 2: j->i, 3: both (invalid)
+        Only the upper triangle is meaningful when used as an unordered-pair state.
+        """
+        a = (A > 0.5)
+        at = a.transpose(-1, -2)
+        typ = torch.zeros_like(A, dtype=torch.int64)
+        typ = typ + (a & (~at)).to(torch.int64) * 1
+        typ = typ + ((~a) & at).to(torch.int64) * 2
+        typ = typ + (a & at).to(torch.int64) * 3
+        return typ
+
+    @staticmethod
+    def _is_acyclic(A: torch.Tensor, mask: torch.Tensor) -> bool:
+        """Check acyclicity of the directed graph induced by A on valid nodes.
+
+        A is a [K,K] adjacency matrix with {0,1} entries where A[i,j]=1 indicates a directed edge i->j.
+        """
+        K = A.shape[0]
+        valid = (mask > 0.5).to(torch.bool)
+        if valid.sum().item() <= 1:
+            return True
+        # Kahn's algorithm
+        A_bin = (A > 0.5).to(torch.int64)
+        indeg = A_bin.sum(dim=0)  # [K]
+        indeg = indeg * valid.to(torch.int64)
+        # nodes not valid are ignored
+        q = [int(i) for i in range(K) if valid[i] and indeg[i].item() == 0]
+        visited = 0
+        A_work = A_bin.clone()
+        indeg_work = indeg.clone()
+        while q:
+            n = q.pop()
+            visited += 1
+            # remove outgoing edges
+            out = A_work[n]
+            if out.sum().item() == 0:
+                continue
+            for j in range(K):
+                if not valid[j] or out[j].item() == 0:
+                    continue
+                indeg_work[j] -= 1
+                A_work[n, j] = 0
+                if indeg_work[j].item() == 0:
+                    q.append(int(j))
+        return visited == int(valid.sum().item())
 
     @staticmethod
     def _pair_distance(agent_feat: torch.Tensor) -> torch.Tensor:
         # agent_feat: [B,K,Da], assume x,y at 0,1
         pos = agent_feat[..., 0:2]
         rel = pos.unsqueeze(2) - pos.unsqueeze(1)
-        dist = torch.norm(rel, dim=-1)  # [B,K,K]
-        return dist
+        return torch.norm(rel, dim=-1)  # [B,K,K]
+
+    @staticmethod
+    def _pair_closest_approach_distance(
+        agent_feat: torch.Tensor,
+        horizon_s: float = 3.0,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Approximate interaction likelihood via constant-velocity closest approach.
+
+        agent_feat is assumed to contain (x,y, yaw, vx, vy, ...).
+
+        Returns:
+          d_min: [B,K,K] where d_min[b,i,j] is the minimal distance between i and j
+          within [0, horizon_s] under constant relative velocity.
+        """
+        if agent_feat.shape[-1] < 5:
+            # Not enough kinematics information; fall back to current distance.
+            return EBSTM._pair_distance(agent_feat)
+
+        pos = agent_feat[..., 0:2]   # [B,K,2]
+        vel = agent_feat[..., 3:5]   # [B,K,2]
+
+        # r_ij = p_j - p_i ; v_ij = v_j - v_i
+        r = pos.unsqueeze(1) - pos.unsqueeze(2)  # [B,K,K,2]
+        v = vel.unsqueeze(1) - vel.unsqueeze(2)  # [B,K,K,2]
+        vv = (v * v).sum(dim=-1)                 # [B,K,K]
+        rv = (r * v).sum(dim=-1)                 # [B,K,K]
+        t_star = (-rv / (vv + eps)).clamp(min=0.0, max=float(horizon_s))  # [B,K,K]
+        closest = r + v * t_star.unsqueeze(-1)
+        d_min = torch.norm(closest, dim=-1)  # [B,K,K]
+
+        # mask diagonal (self-pairs)
+        K = d_min.shape[-1]
+        eye = torch.eye(K, device=d_min.device, dtype=torch.bool).unsqueeze(0)
+        d_min = d_min.masked_fill(eye, float("inf"))
+        return d_min
 
     def generate_candidates(
         self,
@@ -68,82 +222,107 @@ class EBSTM(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate a candidate set of next adjacency matrices per batch item.
 
-        For simplicity, we generate candidates independently per batch element; we then pad to max_candidates.
-        Returns:
-          candidate_A:   [B,C,K,K]
-          candidate_mask:[B,C] (True for valid candidate)
+        This is a *templateized edit-token* generator:
+          - Candidate 0: keep A_t (NOOP token)
+          - Other candidates: apply exactly one local edit on a valid close pair (i,j):
+              add i->j, add j->i, delete, flip direction.
         """
         B, K, _ = A_t.shape
         dist = self._pair_distance(agent_feat)  # [B,K,K]
+        dmin = None
+        if self.use_closest_approach_candidates:
+            dmin = self._pair_closest_approach_distance(agent_feat, horizon_s=float(self.conflict_horizon_s))  # [B,K,K]
         candidates_all: List[List[torch.Tensor]] = []
 
         for b in range(B):
             Ab = A_t[b]
             mb = agent_mask[b]
             db = dist[b]
+            dmb = dmin[b] if dmin is not None else db
+
             cand: List[torch.Tensor] = [Ab.clone()]
 
-            # enumerate close valid pairs
+            # Enumerate candidate unordered pairs (i<j).
+            # We include pairs that are either currently close OR have a small
+            # closest-approach distance within a short horizon.
             pairs: List[Tuple[int, int]] = []
-            for i in range(K):
-                if mb[i] < 0.5:
-                    continue
-                for j in range(i + 1, K):
-                    if mb[j] < 0.5:
-                        continue
-                    if float(db[i, j]) <= self.edit_dist_threshold:
-                        pairs.append((i, j))
+            if K > 1:
+                tri = torch.triu_indices(K, K, offset=1, device=Ab.device)
+                ii = tri[0]
+                jj = tri[1]
+                valid_pair = (mb[ii] > 0.5) & (mb[jj] > 0.5)
 
-            # generate edits
+                d_now = db[ii, jj]
+                d_close = dmb[ii, jj]
+                eligible = valid_pair & (
+                    (d_now <= float(self.edit_dist_threshold))
+                    | (d_close <= float(self.conflict_dist_threshold))
+                )
+
+                # Prioritize by minimum predicted distance (smaller = more relevant).
+                score = torch.minimum(d_now, d_close)
+                score = score.masked_fill(~eligible, float("inf"))
+                order = torch.argsort(score)
+                for idx in order.tolist():
+                    if not torch.isfinite(score[idx]).item():
+                        continue
+                    pairs.append((int(ii[idx].item()), int(jj[idx].item())))
+
             for (i, j) in pairs:
                 if len(cand) >= self.max_candidates:
                     break
+
                 a_ij = int(Ab[i, j].item())
                 a_ji = int(Ab[j, i].item())
+
                 if a_ij == 0 and a_ji == 0:
                     # add either direction
                     A1 = Ab.clone()
                     A1[i, j] = 1
                     A1[j, i] = 0
-                    cand.append(A1)
+                    if (not self.enforce_acyclic) or self._is_acyclic(A1, mb):
+                        cand.append(A1)
                     if len(cand) >= self.max_candidates:
                         break
                     A2 = Ab.clone()
                     A2[j, i] = 1
                     A2[i, j] = 0
-                    cand.append(A2)
+                    if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
+                        cand.append(A2)
                 else:
-                    # delete
+                    # delete both directions
                     A1 = Ab.clone()
                     A1[i, j] = 0
                     A1[j, i] = 0
-                    cand.append(A1)
+                    if (not self.enforce_acyclic) or self._is_acyclic(A1, mb):
+                        cand.append(A1)
                     if len(cand) >= self.max_candidates:
                         break
+
                     # flip if directed
                     if a_ij == 1 and a_ji == 0:
                         A2 = Ab.clone()
                         A2[i, j] = 0
                         A2[j, i] = 1
-                        cand.append(A2)
+                        if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
+                            cand.append(A2)
                     elif a_ji == 1 and a_ij == 0:
                         A2 = Ab.clone()
                         A2[j, i] = 0
                         A2[i, j] = 1
-                        cand.append(A2)
+                        if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
+                            cand.append(A2)
 
             cand = _unique_adjacency(cand)
 
-            # Ensure oracle is included and never truncated away.
+            # Ensure oracle is included and never truncated away (for supervised structure training).
             if oracle_next is not None:
                 A_or = oracle_next[b].clone()
-                # Reorder: [A_t, A_or, ...]
-                new: List[torch.Tensor] = []
-                new.append(Ab.clone())
+                new: List[torch.Tensor] = [Ab.clone()]
                 if not torch.equal(A_or, new[0]):
                     new.append(A_or)
                 for A in cand:
-                    if torch.equal(A, new[0]) or (len(new) > 1 and torch.equal(A, new[1])):
+                    if any(torch.equal(A, U) for U in new):
                         continue
                     new.append(A)
                     if len(new) >= self.max_candidates:
@@ -155,8 +334,7 @@ class EBSTM(nn.Module):
             candidates_all.append(cand)
 
         # pad to [B,C,K,K]
-        C = max(len(c) for c in candidates_all)
-        C = min(C, self.max_candidates)
+        C = min(max(len(c) for c in candidates_all), self.max_candidates)
         out = torch.zeros((B, C, K, K), device=A_t.device, dtype=A_t.dtype)
         out_mask = torch.zeros((B, C), device=A_t.device, dtype=torch.bool)
         for b, cand in enumerate(candidates_all):
@@ -167,29 +345,66 @@ class EBSTM(nn.Module):
         return out, out_mask
 
     @staticmethod
-    def energy_of_structure(pair: PairEnergies, A: torch.Tensor) -> torch.Tensor:
-        """Compute total energy ε(A) by summing token energies over unordered pairs.
+    def energies_of_candidates(pair: EditTokenEnergies, A_t: torch.Tensor, candidate_A: torch.Tensor) -> torch.Tensor:
+        """Vectorized **transition** energy over edit tokens δ(prev→next).
 
-        pair: PairEnergies with e_dir/e_none and pair_mask
-        A:    [B,K,K] adjacency (0/1)
+        Args:
+          pair:        EditTokenEnergies with e_edit: [B,K,K,9]
+          A_t:         [B,K,K]
+          candidate_A: [B,C,K,K]
         Returns:
-          E: [B]
+          energies:    [B,C]
         """
-        e_dir, e_none, pm = pair.e_dir, pair.e_none, pair.pair_mask
-        B, K, _ = A.shape
-        E = torch.zeros((B,), device=A.device, dtype=torch.float32)
-        A_bin = (A > 0.5)
-        for i in range(K):
-            for j in range(i + 1, K):
-                valid = pm[:, i, j]
-                if not valid.any():
-                    continue
-                # choose directed vs none
-                a_ij = A_bin[:, i, j]
-                a_ji = A_bin[:, j, i]
-                e = torch.where(a_ij, e_dir[:, i, j], torch.where(a_ji, e_dir[:, j, i], e_none[:, i, j]))
-                E = E + e.to(dtype=E.dtype) * valid.to(dtype=E.dtype)
-        return E
+        e_edit = pair.e_edit  # [B,K,K,9]
+        pm = pair.pair_mask   # [B,K,K] bool
+        B, C, K, _ = candidate_A.shape
+
+        prev = EBSTM._relation_state3(A_t)  # [B,K,K] in {0,1,2,3}
+        nxt = EBSTM._relation_state3(candidate_A)  # [B,C,K,K]
+
+        # Handle invalid "both" edges by clamping and adding a large penalty.
+        invalid = (prev == 3).unsqueeze(1) | (nxt == 3)
+        prev = prev.clamp_max(2)
+        nxt = nxt.clamp_max(2)
+        tok = (prev.unsqueeze(1) * 3 + nxt).clamp(min=0, max=8)  # [B,C,K,K]
+
+        # NOTE: torch.gather does **not** broadcast the candidate dimension.
+        # Expand explicitly so this works for any C>1.
+        e = e_edit.unsqueeze(1).expand(-1, C, -1, -1, -1)  # [B,C,K,K,9]
+        e_tok = torch.gather(e, dim=-1, index=tok.unsqueeze(-1)).squeeze(-1)  # [B,C,K,K]
+
+        triu = torch.triu(torch.ones((K, K), device=candidate_A.device, dtype=torch.bool), diagonal=1)
+        valid = (pm & triu).unsqueeze(1)
+        E = (e_tok * valid.to(dtype=e_tok.dtype)).sum(dim=(-1, -2))  # [B,C]
+
+        if invalid.any():
+            # Penalize any invalid relation state on valid pairs.
+            inv = (invalid & valid).to(torch.float32).sum(dim=(-1, -2))
+            E = E + inv * 1e6
+
+        return E.to(dtype=torch.float32)
+
+    def _uncertainty_penalty(self, candidate_A: torch.Tensor, z_logvar: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
+        """Optional structure-level uncertainty penalty.
+
+        Penalize interactions between agents with uncertain preferences (high variance).
+        """
+        if self.uncertainty_penalty_scale <= 0.0:
+            return torch.zeros(candidate_A.shape[:2], device=candidate_A.device, dtype=torch.float32)
+
+        B, C, K, _ = candidate_A.shape
+        triu = torch.triu(torch.ones((K, K), device=candidate_A.device, dtype=torch.bool), diagonal=1)
+        valid = (pair_mask & triu).unsqueeze(1)  # [B,1,K,K]
+        a = (candidate_A > 0.5)
+        aT = a.transpose(-1, -2)
+        edge = (a | aT)  # [B,C,K,K] True if any directed edge exists between i and j
+
+        var = torch.exp(z_logvar).mean(dim=-1)  # [B,K]
+        sum_var = var.unsqueeze(-1) + var.unsqueeze(-2)  # [B,K,K]
+        sum_var = sum_var.unsqueeze(1)  # [B,1,K,K]
+        pen = edge.to(dtype=torch.float32) * sum_var.to(dtype=torch.float32)
+        pen = (pen * valid.to(dtype=torch.float32)).sum(dim=(-1, -2))  # [B,C]
+        return pen * float(self.uncertainty_penalty_scale)
 
     def forward(
         self,
@@ -199,23 +414,86 @@ class EBSTM(nn.Module):
         z_logvar: torch.Tensor,   # [B,K,Dz]
         agent_mask: torch.Tensor, # [B,K]
         oracle_next: Optional[torch.Tensor] = None,  # [B,K,K]
+        # Optional structure-level penalties (paper E_smooth + E_phys).
+        smooth_scale: float = 0.0,
+        phys_dist_threshold_m: float = 1e9,
+        phys_penalty_scale: float = 0.0,
     ) -> EBSTMOutput:
         candidate_A, cand_mask = self.generate_candidates(A_t, agent_feat, agent_mask, oracle_next=oracle_next)
-        B, C, K, _ = candidate_A.shape
 
-        pair = self.energy_net(agent_feat, z_mean, z_logvar, agent_mask)  # [B,K,K] pair energies for factual
-        # compute energy for each candidate
-        energies = []
-        for c in range(C):
-            E = self.energy_of_structure(pair, candidate_A[:, c])
-            energies.append(E)
-        energies = torch.stack(energies, dim=1)  # [B,C]
+        pair = self.energy_net(agent_feat, z_mean, z_logvar, agent_mask)          # per-pair edit energies
+        energies = self.energies_of_candidates(pair, A_t, candidate_A)            # [B,C]
+
+        # Smoothness penalty: discourage large edits between A_t and A_{t+Δ}.
+        if float(smooth_scale) > 0.0:
+            energies = energies + float(smooth_scale) * self._smooth_penalty(A_t, candidate_A)
+
+        # Physical plausibility penalty: discourage edges between very distant agents.
+        if float(phys_penalty_scale) > 0.0:
+            energies = energies + float(phys_penalty_scale) * self._phys_penalty(agent_feat, candidate_A, pair.pair_mask, float(phys_dist_threshold_m))
+
+        # Optional extra penalty at structure level
+        energies = energies + self._uncertainty_penalty(candidate_A, z_logvar, pair.pair_mask)
 
         # mask out padded candidates
         logits = -energies / float(self.temperature)
         logits = logits.masked_fill(~cand_mask, -1e9)
         probs = torch.softmax(logits, dim=1)
-        return EBSTMOutput(candidate_A=candidate_A, candidate_mask=cand_mask, energies=energies, probs=probs, pair_energies=pair)
+        edit_tokens = self.extract_edit_tokens(A_t, candidate_A)
+        return EBSTMOutput(candidate_A=candidate_A, candidate_mask=cand_mask, energies=energies, probs=probs, edit_tokens=edit_tokens, pair_energies=pair)
+
+    @staticmethod
+    def _relation_type(A: torch.Tensor) -> torch.Tensor:
+        """Map a directed adjacency matrix to a 3-state per unordered pair encoding.
+
+        For each (i,j) with i<j:
+          0: none, 1: i->j, 2: j->i, 3: both (invalid)
+
+        Returns a tensor of shape [...,K,K] where only upper-triangle entries are meaningful.
+        """
+        a = (A > 0.5)
+        at = a.transpose(-1, -2)
+        # upper triangle encoding
+        typ = torch.zeros_like(A, dtype=torch.int64)
+        typ = typ + (a & (~at)).to(torch.int64) * 1
+        typ = typ + ((~a) & at).to(torch.int64) * 2
+        typ = typ + (a & at).to(torch.int64) * 3
+        return typ
+
+    def _smooth_penalty(self, A_t: torch.Tensor, candidate_A: torch.Tensor) -> torch.Tensor:
+        """Hamming distance in 3-state relation space over i<j pairs."""
+        B, C, K, _ = candidate_A.shape
+        triu = torch.triu(torch.ones((K, K), device=candidate_A.device, dtype=torch.bool), diagonal=1)
+        t0 = self._relation_type(A_t).unsqueeze(1)          # [B,1,K,K]
+        t1 = self._relation_type(candidate_A)               # [B,C,K,K]
+        diff = (t1 != t0) & triu.unsqueeze(0).unsqueeze(0)
+        return diff.to(torch.float32).sum(dim=(-1, -2))     # [B,C]
+
+    @staticmethod
+    def _phys_penalty(
+        agent_feat: torch.Tensor,       # [B,K,Da]
+        candidate_A: torch.Tensor,      # [B,C,K,K]
+        pair_mask: torch.Tensor,        # [B,K,K]
+        dist_threshold_m: float,
+    ) -> torch.Tensor:
+        """Penalize candidate edges that connect agents farther than dist_threshold_m."""
+        if not torch.isfinite(torch.tensor(dist_threshold_m)):
+            return torch.zeros(candidate_A.shape[:2], device=candidate_A.device, dtype=torch.float32)
+
+        pos = agent_feat[..., 0:2]  # [B,K,2] (ego-local x,y)
+        rel = pos.unsqueeze(2) - pos.unsqueeze(1)  # [B,K,K,2]
+        dist = torch.norm(rel, dim=-1)  # [B,K,K]
+
+        B, C, K, _ = candidate_A.shape
+        triu = torch.triu(torch.ones((K, K), device=candidate_A.device, dtype=torch.bool), diagonal=1)
+        valid = (pair_mask & triu).unsqueeze(1)  # [B,1,K,K]
+
+        a = (candidate_A > 0.5)
+        edge_any = a | a.transpose(-1, -2)  # [B,C,K,K]
+        far = F.relu(dist.unsqueeze(1) - float(dist_threshold_m))
+        pen = (edge_any.to(torch.float32) * far.to(torch.float32))
+        pen = (pen * valid.to(torch.float32)).sum(dim=(-1, -2))
+        return pen
 
     @staticmethod
     def oracle_index(candidate_A: torch.Tensor, oracle_next: torch.Tensor) -> torch.Tensor:
@@ -240,29 +518,162 @@ class EBSTM(nn.Module):
         agent_mask: torch.Tensor,
         horizon_steps: int = 5,
         num_samples: int = 16,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_indices: bool = False,
+        entropy_stop_threshold: Optional[float] = None,
+        min_horizon_steps: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Sample rollouts of interaction structures.
 
+        Args:
+          entropy_stop_threshold: if set, we stop evolving a batch item once the transition entropy exceeds it.
+                                  Remaining steps repeat the last structure (predictability-adaptive horizon).
         Returns:
-          A_samples: [B, num_samples, horizon_steps, K, K]
-          logp: [B, num_samples] (log prob under the EB-STM transitions)
+          A_samples: [B, S, H, K, K]
+          logp:      [B, S] (log prob under the EB-STM transitions)
+          idx:       [B, S, H] indices of chosen candidates (optional; padding indices are 0)
         """
         B, K, _ = A0.shape
-        A_samples = torch.zeros((B, num_samples, horizon_steps, K, K), device=A0.device, dtype=A0.dtype)
-        logp = torch.zeros((B, num_samples), device=A0.device, dtype=torch.float32)
+        H = int(horizon_steps)
+        S = int(num_samples)
 
-        for s in range(num_samples):
+        A_samples = torch.zeros((B, S, H, K, K), device=A0.device, dtype=A0.dtype)
+        logp = torch.zeros((B, S), device=A0.device, dtype=torch.float32)
+        idx_samples = torch.zeros((B, S, H), device=A0.device, dtype=torch.int64) if return_indices else None
+
+        for s in range(S):
             A_t = A0
             lp = torch.zeros((B,), device=A0.device, dtype=torch.float32)
-            for h in range(horizon_steps):
+            active = torch.ones((B,), device=A0.device, dtype=torch.bool)
+
+            for h in range(H):
+                if not active.any():
+                    # fill remaining
+                    A_samples[:, s, h:] = A_t.unsqueeze(1).expand(B, H - h, K, K)
+                    break
+
                 out = self.forward(A_t, agent_feat, z_mean, z_logvar, agent_mask, oracle_next=None)
-                # sample candidate
+
+                # entropy stop test (per batch)
+                if entropy_stop_threshold is not None and h + 1 >= int(min_horizon_steps):
+                    p = out.probs.clamp_min(1e-12)
+                    ent = -(p * torch.log(p)).sum(dim=-1)  # [B]
+                    stop = ent > float(entropy_stop_threshold)
+                else:
+                    stop = torch.zeros((B,), device=A0.device, dtype=torch.bool)
+
+                # sample next for active & not stopped
                 cat = torch.distributions.Categorical(probs=out.probs)
                 idx = cat.sample()  # [B]
-                # gather
                 A_next = out.candidate_A[torch.arange(B, device=A0.device), idx]
+
+                # apply stopping: if stop, keep A_t and no additional log prob
+                A_next = torch.where(stop.view(B, 1, 1), A_t, A_next)
+                p_sel = out.probs[torch.arange(B, device=A0.device), idx].clamp_min(1e-12)
+                lp_step = torch.where(stop, torch.zeros_like(lp), torch.log(p_sel))
+                lp = lp + lp_step
+
                 A_samples[:, s, h] = A_next
-                lp = lp + torch.log(out.probs[torch.arange(B, device=A0.device), idx] + 1e-8)
+                if return_indices:
+                    idx_samples[:, s, h] = idx
+
                 A_t = A_next
+                active = active & (~stop)
+
             logp[:, s] = lp
-        return A_samples, logp
+
+        return A_samples, logp, idx_samples
+
+    @torch.no_grad()
+    def beam_rollout(
+        self,
+        A0: torch.Tensor,
+        agent_feat: torch.Tensor,
+        z_mean: torch.Tensor,
+        z_logvar: torch.Tensor,
+        agent_mask: torch.Tensor,
+        *,
+        max_horizon_steps: int = 5,
+        beam_size: int = 8,
+        entropy_stop_threshold: Optional[float] = None,
+        min_horizon_steps: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Beam rollout over structures (top-K sequences).
+
+        Args:
+          entropy_stop_threshold: if set, stop expanding a batch item once transition entropy exceeds it.
+        Returns:
+          A_beams:  [B, beam, H, K, K] (H == max_horizon_steps; if stopped early, last structure is repeated)
+          logp:     [B, beam]
+        """
+        B, K, _ = A0.shape
+        H = int(max_horizon_steps)
+        beam = int(max(1, beam_size))
+
+        # per batch, maintain beams
+        A_beams = torch.zeros((B, beam, H, K, K), device=A0.device, dtype=A0.dtype)
+        logp_beams = torch.full((B, beam), float("-inf"), device=A0.device, dtype=torch.float32)
+
+        # Initialize beams with A0
+        curr_A = A0.unsqueeze(1).expand(B, beam, K, K).clone()
+        logp_beams[:, 0] = 0.0  # first beam active
+
+        active = torch.ones((B,), device=A0.device, dtype=torch.bool)
+        last_h = -1
+
+        for h in range(H):
+            last_h = h
+            if not active.any():
+                break
+
+            # Flatten active beams
+            A_flat = curr_A.reshape(B * beam, K, K)
+            mask_flat = agent_mask.unsqueeze(1).expand(B, beam, -1).reshape(B * beam, K)
+            feat_flat = agent_feat.unsqueeze(1).expand(B, beam, -1, -1).reshape(B * beam, K, -1)
+            z_mean_flat = z_mean.unsqueeze(1).expand(B, beam, -1, -1).reshape(B * beam, K, -1)
+            z_logvar_flat = z_logvar.unsqueeze(1).expand(B, beam, -1, -1).reshape(B * beam, K, -1)
+
+            out = self.forward(A_flat, feat_flat, z_mean_flat, z_logvar_flat, mask_flat, oracle_next=None)
+            # out.probs: [B*beam, C]
+            C = out.probs.shape[1]
+            # entropy for each flattened beam
+            if entropy_stop_threshold is not None:
+                ent = -(out.probs.clamp_min(1e-12) * torch.log(out.probs.clamp_min(1e-12))).sum(dim=-1)  # [B*beam]
+                ent = ent.view(B, beam)
+                # stop criterion based on best beam (beam 0) entropy
+                stop_b = ent[:, 0] > float(entropy_stop_threshold)
+                if h + 1 >= int(min_horizon_steps):
+                    active = active & (~stop_b)
+
+            # Expand beams: for each existing beam, take top candidates
+            topk = min(beam, C)
+            top_p, top_idx = torch.topk(out.probs, k=topk, dim=1)  # [B*beam, topk]
+            top_logp = torch.log(top_p.clamp_min(1e-12))            # [B*beam, topk]
+
+            # Gather next A
+            cand = out.candidate_A  # [B*beam, C, K, K]
+            next_A = cand[torch.arange(B * beam, device=A0.device).unsqueeze(-1), top_idx]  # [B*beam, topk, K,K]
+
+            # Combine scores
+            base_lp = logp_beams.view(B * beam, 1)  # [B*beam,1]
+            new_lp = base_lp + top_logp             # [B*beam,topk]
+            new_lp = new_lp.view(B, beam * topk)    # [B, beam*topk]
+            next_A = next_A.view(B, beam * topk, K, K)
+
+            # Mask inactive batches: keep previous beams (no update)
+            if active.any():
+                # Select top beams per batch
+                sel_lp, sel_idx = torch.topk(new_lp, k=beam, dim=1)
+                sel_A = next_A[torch.arange(B, device=A0.device).unsqueeze(-1), sel_idx]  # [B,beam,K,K]
+
+                # Update only active batches
+                curr_A = torch.where(active.view(B, 1, 1, 1), sel_A, curr_A)
+                logp_beams = torch.where(active.view(B, 1), sel_lp, logp_beams)
+
+            # Write to output sequences
+            A_beams[:, :, h] = curr_A
+
+        # Fill any remaining horizon steps if we stopped early (repeat the last structure).
+        if last_h < H - 1 and last_h >= 0:
+            A_beams[:, :, last_h + 1 :] = curr_A.unsqueeze(2).expand(B, beam, H - last_h - 1, K, K)
+
+        return A_beams, logp_beams

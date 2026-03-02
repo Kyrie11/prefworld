@@ -1,0 +1,49 @@
+seed: 0
+device: cuda
+
+dataset:
+  cache_dir: /path/to/cache/prefworld_train
+  split: train
+  kind: samples
+  max_samples: null
+
+model:
+  agent_feat_dim: 7
+  z_dim: 8
+  tau_dim: 64
+  pc_hidden: 128
+  template_hidden: 128
+  energy_hidden: 128
+  eb_temperature: 1.0
+  eb_max_candidates: 64
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+
+train:
+  output_dir: outputs_stage2_eb
+  batch_size: 16
+  num_workers: 4
+  max_epochs: 10
+  grad_clip_norm: 5.0
+
+  # Load a Stage-1 checkpoint and freeze PC+template while training EB-STM.
+  stage1_checkpoint: /path/to/outputs_stage1_pc/best.pt
+
+  # EB transition loss
+  w_eb: 1.0
+
+  # Optional smoothness and physical plausibility penalties in EB-STM
+  eb_smooth_scale: 0.1
+  eb_phys_dist_threshold_m: 50.0
+  eb_phys_penalty_scale: 1.0
+
+  # Counterfactual conservatism regularizer (paper Eq.(26))
+  # Set eb_cf_weight>0 to enable.
+  eb_cf_weight: 0.0
+  eb_cf_base_temperature: 2.0
+  eb_cf_actions: [0, 1, 2]  # KEEP, LCL, LCR
+
+  log_interval: 20
+  val_interval: 0

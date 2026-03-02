@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from prefworld.models.gaussian import DiagGaussian, NaturalDiagGaussian
-
-
-def wrap_angle(angle: torch.Tensor) -> torch.Tensor:
-    """Wrap angle to (-pi, pi]."""
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
+from prefworld.models.motion_primitives import MotionPrimitiveDecoder, PrimitiveDecodeOutput
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: Optional[int] = None, eps: float = 1e-6) -> torch.Tensor:
+    """Mean of x over entries where mask==1.
+
+    mask can be bool or float.
+    """
     mask_f = mask.to(dtype=x.dtype)
     if dim is None:
         return (x * mask_f).sum() / (mask_f.sum() + eps)
@@ -29,37 +29,40 @@ class PreferencePosterior:
 
     q: DiagGaussian               # [B,N,Dz]
     nat: NaturalDiagGaussian      # [B,N,Dz]
-    alpha: torch.Tensor          # [B,N,T] evidence reliability gates
+    alpha: torch.Tensor           # [B,N,T] evidence reliability gates
 
 
 @dataclass
 class PreferenceCompletionOutput:
     """Outputs for preference completion training."""
 
-    # posteriors
     post_full: PreferencePosterior
     post_ctx: PreferencePosterior
 
-    # masks
-    ctx_mask: torch.Tensor       # [B,N,T]
-    query_mask: torch.Tensor     # [B,N,T]
+    ctx_mask: torch.Tensor        # [B,N,T]
+    query_mask: torch.Tensor      # [B,N,T]
 
-    # losses (scalars)
+    maneuver_logits_last: torch.Tensor  # [B,N,M]
+
+    # scalar losses
     loss_total: torch.Tensor
+
     loss_query_nll: torch.Tensor
-    loss_kl_full_ctx: torch.Tensor
+    loss_distill_mu: torch.Tensor
+    loss_distill_cov: torch.Tensor
     loss_kl_ctx_prior: torch.Tensor
-    loss_prec_reg: torch.Tensor
+    loss_contrastive: torch.Tensor
+    loss_overlap: torch.Tensor
+    loss_modulation: torch.Tensor
 
 
 class EvidenceEncoder(nn.Module):
-    """Encode each evidence token (X_{i,t}, τ_{i,t}) into natural-parameter increments.
+    """Encode each evidence token into natural-parameter increments.
 
-    This follows the paper's neural evidence accumulation scheme:
-      (Δη, ΔΛ, α) = f(e_{i,t})
-      η = η0 + Σ α Δη,   Λ = Λ0 + Σ α ΔΛ
+    Paper Eq.(15):
+      (α_t, ΔΛ_t, Δη_t) = f_φ(e_t),  α∈(0,1],  ΔΛ≽0
 
-    Here we implement a diagonal-precision version for stability.
+    We implement a diagonal-precision version for stability.
     """
 
     def __init__(
@@ -95,12 +98,12 @@ class EvidenceEncoder(nn.Module):
         x: torch.Tensor,         # [B,N,T,Dx]
         tau: torch.Tensor,       # [B,N,T,Dt]
         ctx: torch.Tensor,       # [B,N,T,Dc]
-        mask: torch.Tensor,      # [B,N,T] (bool/float)
+        mask: torch.Tensor,      # [B,N,T]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.net(torch.cat([x, tau, ctx], dim=-1))
-        delta_eta = self.to_eta(h)                       # [B,N,T,Dz]
-        delta_L = F.softplus(self.to_L(h))              # [B,N,T,Dz] >= 0
-        alpha = torch.sigmoid(self.to_alpha(h)).squeeze(-1)  # [B,N,T]
+        delta_eta = self.to_eta(h)                              # [B,N,T,Dz]
+        delta_L = F.softplus(self.to_L(h))                      # [B,N,T,Dz] >= 0
+        alpha = torch.sigmoid(self.to_alpha(h)).squeeze(-1)     # [B,N,T]
 
         m = mask > 0.5
         delta_eta = delta_eta * m.unsqueeze(-1).to(dtype=delta_eta.dtype)
@@ -109,89 +112,22 @@ class EvidenceEncoder(nn.Module):
         return delta_eta, delta_L, alpha
 
 
-class ActionDecoder(nn.Module):
-    """Template-conditioned action likelihood p(X | z, τ).
-
-    We decode each token x_t (e.g., Δpose) as a diagonal Gaussian whose mean
-    is modulated by z through FiLM on τ.
-    """
-
-    def __init__(
-        self,
-        *,
-        x_dim: int,
-        tau_dim: int,
-        z_dim: int,
-        hidden_dim: int = 128,
-        pred_logstd: bool = True,
-        min_logstd: float = -5.0,
-        max_logstd: float = 2.0,
-    ) -> None:
-        super().__init__()
-        self.x_dim = int(x_dim)
-        self.tau_dim = int(tau_dim)
-        self.z_dim = int(z_dim)
-        self.pred_logstd = bool(pred_logstd)
-        self.min_logstd = float(min_logstd)
-        self.max_logstd = float(max_logstd)
-
-        self.tau_proj = nn.Sequential(
-            nn.Linear(tau_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.z_to_film = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim),
-        )
-        self.dec = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.out_mu = nn.Linear(hidden_dim, x_dim)
-        if pred_logstd:
-            self.out_logstd = nn.Linear(hidden_dim, x_dim)
-        else:
-            self.logstd_param = nn.Parameter(torch.zeros(x_dim))
-
-    def forward(self, z: torch.Tensor, tau: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Args:
-        z:   [B,N,Dz]
-        tau: [B,N,T,Dt]
-        Returns:
-          mu_x:     [B,N,T,Dx]
-          logstd_x: [B,N,T,Dx]
-        """
-        B, N, T, _ = tau.shape
-        h_tau = self.tau_proj(tau)
-        film = self.z_to_film(z)  # [B,N,2H]
-        gamma, beta = film.chunk(2, dim=-1)
-        h = h_tau * (1.0 + gamma.unsqueeze(2)) + beta.unsqueeze(2)
-        h = self.dec(h)
-        mu = self.out_mu(h)
-        if self.pred_logstd:
-            logstd = torch.clamp(self.out_logstd(h), min=self.min_logstd, max=self.max_logstd)
-        else:
-            logstd = torch.clamp(self.logstd_param.view(1, 1, 1, -1).expand_as(mu), min=self.min_logstd, max=self.max_logstd)
-        return mu, logstd
-
-
 class PreferenceCompletion(nn.Module):
-    """Preference completion via neural evidence accumulation (paper-aligned).
+    """Preference completion via tempered neural evidence accumulation.
 
-    This module implements:
-      q(z | S) where S is any subset of evidence tokens (X_{i,t}, τ_{i,t})
-    and the conditional variational objective used in preference completion:
+    Implements paper Sec.4 objective (Eq.18):
 
-      L = -E_{q(z|C∪Q)}[ Σ_{t∈Q} log p(X_t | z, τ_t) ]
-          + λ_kl KL(q(z|C∪Q) || q(z|C))
-          + λ_prior KL(q(z|C) || p(z))
-          + λ_Λ Σ_t ||ΔΛ_t||_F^2
+      L_PC = -E_{q(z|C)}[ Σ_{t∈Q} log p(X_t | z, τ_t) ]
+             + λ^μ ||μ_C - sg(μ_{C∪Q})||^2
+             + λ^Σ KL(N(0, sg(Σ_{C∪Q})) || N(0, Σ_C))
+             + λ_prior KL(q(z|C) || p(z))
+             + λ_con L_con
+             + λ_Λ R_Λ
 
-    We use a diagonal precision Λ for stability.
+    Notes:
+      - We use diagonal Gaussians for q(z).
+      - Maneuvers are latent and marginalized inside p(X_t|z,τ_t).
+      - The primitive emission model is pluggable via MotionPrimitiveDecoder.
     """
 
     def __init__(
@@ -203,23 +139,39 @@ class PreferenceCompletion(nn.Module):
         z_dim: int,
         hidden_dim: int = 128,
         prior_logvar: float = 0.0,
-        lambda_u: float = 1.0,
+        num_maneuvers: int = 6,
+        # contrastive head
+        con_proj_dim: int = 32,
+        con_temperature: float = 0.2,
     ) -> None:
         super().__init__()
         self.x_dim = int(x_dim)
         self.tau_dim = int(tau_dim)
         self.ctx_dim = int(ctx_dim)
         self.z_dim = int(z_dim)
+        self.num_maneuvers = int(num_maneuvers)
+        self.con_temperature = float(con_temperature)
 
         self.evidence = EvidenceEncoder(x_dim=x_dim, tau_dim=tau_dim, ctx_dim=ctx_dim, z_dim=z_dim, hidden_dim=hidden_dim)
-        self.decoder = ActionDecoder(x_dim=x_dim, tau_dim=tau_dim, z_dim=z_dim, hidden_dim=hidden_dim)
+        self.decoder = MotionPrimitiveDecoder(
+            x_dim=x_dim,
+            tau_dim=tau_dim,
+            ctx_dim=ctx_dim,
+            z_dim=z_dim,
+            num_maneuvers=self.num_maneuvers,
+            hidden_dim=hidden_dim,
+        )
+
+        # Projection head g for contrastive embeddings r=normalize(g(μ))
+        self.con_head = nn.Sequential(
+            nn.Linear(z_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, int(con_proj_dim)),
+        )
 
         # fixed diagonal Gaussian prior p(z) = N(0, exp(prior_logvar) I)
         self.register_buffer("prior_mean", torch.zeros(z_dim))
         self.register_buffer("prior_logvar", torch.full((z_dim,), float(prior_logvar)))
-
-        # not used here, but kept for compatibility with the paper notation
-        self.lambda_u = float(lambda_u)
 
     def prior(self, batch_shape: Tuple[int, ...], device=None, dtype=None) -> DiagGaussian:
         mean = self.prior_mean.to(device=device, dtype=dtype).expand(*batch_shape, self.z_dim)
@@ -238,11 +190,9 @@ class PreferenceCompletion(nn.Module):
         m = mask > 0.5
         a = alpha.unsqueeze(-1)
 
-        # prior in natural form (standard normal or fixed diag)
         prior = self.prior((B, N), device=delta_eta.device, dtype=delta_eta.dtype)
         nat0 = NaturalDiagGaussian.from_moment(prior)
 
-        # pool natural increments over selected tokens
         pooled_eta = nat0.eta + (a * delta_eta * m.unsqueeze(-1).to(dtype=delta_eta.dtype)).sum(dim=2)
         pooled_L = nat0.Lambda + (a * delta_L * m.unsqueeze(-1).to(dtype=delta_L.dtype)).sum(dim=2)
         nat = NaturalDiagGaussian(eta=pooled_eta, Lambda=pooled_L.clamp_min(1e-6))
@@ -250,71 +200,111 @@ class PreferenceCompletion(nn.Module):
         return PreferencePosterior(q=q, nat=nat, alpha=alpha)
 
     @staticmethod
-    def _ensure_nonempty(mask_all: torch.Tensor, mask_ctx: torch.Tensor) -> torch.Tensor:
-        """Guarantee each (B,N) has at least one context token if it has any valid token."""
+    def _ensure_nonempty(mask_all: torch.Tensor, mask_sub: torch.Tensor) -> torch.Tensor:
+        """Ensure each (B,N) with any valid token has >=1 token in mask_sub."""
         B, N, T = mask_all.shape
         valid = mask_all.sum(dim=-1) > 0
-        ctx = mask_ctx.sum(dim=-1) > 0
-        need = valid & (~ctx)
+        sub_ok = mask_sub.sum(dim=-1) > 0
+        need = valid & (~sub_ok)
         if need.any():
-            # pick the first valid token as context
             idx = mask_all.float().argmax(dim=-1)  # [B,N]
             b, n = need.nonzero(as_tuple=True)
-            mask_ctx = mask_ctx.clone()
-            mask_ctx[b, n, idx[b, n]] = 1.0
-        return mask_ctx
+            mask_sub = mask_sub.clone()
+            mask_sub[b, n, idx[b, n]] = 1.0
+        return mask_sub
 
     def split_context_query(
         self,
         valid_mask: torch.Tensor,  # [B,N,T]
         *,
-        mode: str = "random",      # "random" or "prefix"
+        mode: str = "random",      # random | prefix
         query_ratio: float = 0.3,
+        ensure_query_nonempty: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Split valid_mask into (ctx_mask, query_mask)."""
+        """Split valid_mask into (ctx_mask, query_mask).
+
+        If query_ratio <= 0, returns ctx=valid and query=0.
+        """
         m = valid_mask > 0.5
         B, N, T = m.shape
+
+        if float(query_ratio) <= 0.0:
+            ctx_mask = m.to(dtype=torch.float32)
+            query_mask = torch.zeros_like(ctx_mask)
+            return ctx_mask, query_mask
+
         if mode == "prefix":
-            # choose a cutoff per (B,N) among valid tokens
-            # If length < 2, no query.
             lengths = m.sum(dim=-1).clamp(min=0).to(torch.int64)  # [B,N]
-            # cutoff in [1, len-1]
             cutoff = torch.zeros((B, N), device=m.device, dtype=torch.int64)
-            # sample only where length >= 2
             ok = lengths >= 2
             if ok.any():
-                # randint high is exclusive
-                cutoff[ok] = torch.randint(low=1, high=(lengths[ok]).min().item() + 1, size=(int(ok.sum().item()),), device=m.device)
-                # The above uses a shared upper bound; refine per element using modulo trick
-                # to avoid python loops.
-                cutoff[ok] = 1 + (torch.randint(0, 10_000, (int(ok.sum().item()),), device=m.device) % (lengths[ok] - 1))
+                rnd = torch.randint(0, 10_000, (int(ok.sum().item()),), device=m.device)
+                cutoff[ok] = 1 + (rnd % (lengths[ok] - 1))
             t_idx = torch.arange(T, device=m.device).view(1, 1, T)
-            # prefix over time index, but only for valid tokens
             ctx_mask = (t_idx < cutoff.unsqueeze(-1)) & m
             query_mask = m & (~ctx_mask)
         else:
-            # random subset as query
             rnd = torch.rand((B, N, T), device=m.device)
             query_mask = (rnd < float(query_ratio)) & m
             ctx_mask = m & (~query_mask)
             ctx_mask = self._ensure_nonempty(m.to(dtype=torch.float32), ctx_mask.to(dtype=torch.float32)) > 0.5
             query_mask = m & (~ctx_mask)
 
-        # ensure query non-empty when possible (otherwise loss_query=0)
-        # If there are >=2 valid tokens and query is empty, move the last valid token to query.
-        lengths = m.sum(dim=-1)
-        q_counts = query_mask.sum(dim=-1)
-        need_q = (lengths >= 2) & (q_counts == 0)
-        if need_q.any():
-            last_valid = (m.to(torch.int64).cumsum(dim=-1) == lengths.unsqueeze(-1).to(torch.int64)).to(torch.int64).argmax(dim=-1)
-            b, n = need_q.nonzero(as_tuple=True)
-            t = last_valid[b, n]
-            query_mask = query_mask.clone()
-            ctx_mask = ctx_mask.clone()
-            query_mask[b, n, t] = True
-            ctx_mask[b, n, t] = False
+        if ensure_query_nonempty:
+            lengths = m.sum(dim=-1)
+            q_counts = query_mask.sum(dim=-1)
+            need_q = (lengths >= 2) & (q_counts == 0)
+            if need_q.any():
+                # pick the last valid token as query
+                last_valid = (m.to(torch.int64).cumsum(dim=-1) == lengths.unsqueeze(-1).to(torch.int64)).to(torch.int64).argmax(dim=-1)
+                b, n = need_q.nonzero(as_tuple=True)
+                t = last_valid[b, n]
+                query_mask = query_mask.clone()
+                ctx_mask = ctx_mask.clone()
+                query_mask[b, n, t] = True
+                ctx_mask[b, n, t] = False
 
         return ctx_mask.to(dtype=torch.float32), query_mask.to(dtype=torch.float32)
+
+    @staticmethod
+    def _kl_zero_mean_diag(teacher_logvar: torch.Tensor, student_logvar: torch.Tensor) -> torch.Tensor:
+        """KL(N(0, Σ_t) || N(0, Σ_s)) for diagonal covariances.
+
+        Args:
+          teacher_logvar: [...,D]
+          student_logvar: [...,D]
+        Returns:
+          kl: [...]
+        """
+        v_t = torch.exp(teacher_logvar)
+        v_s = torch.exp(student_logvar)
+        return 0.5 * torch.sum(student_logvar - teacher_logvar + v_t / (v_s + 1e-8) - 1.0, dim=-1)
+
+    def _contrastive_loss(self, mu1: torch.Tensor, mu2: torch.Tensor, agent_valid: torch.Tensor) -> torch.Tensor:
+        """InfoNCE over (B,N) agents in a batch.
+
+        Args:
+          mu1,mu2: [B,N,Dz]
+          agent_valid: [B,N] bool/float
+        Returns:
+          scalar loss
+        """
+        m = agent_valid > 0.5
+        if m.sum() <= 1:
+            return torch.zeros((), device=mu1.device, dtype=torch.float32)
+
+        # flatten valid agents
+        mu1_f = mu1[m]
+        mu2_f = mu2[m]
+
+        r1 = F.normalize(self.con_head(mu1_f), dim=-1)
+        r2 = F.normalize(self.con_head(mu2_f), dim=-1)
+
+        sim = (r1 @ r2.t()) / max(1e-6, self.con_temperature)  # [M,M]
+        logp = F.log_softmax(sim, dim=1)
+        idx = torch.arange(sim.shape[0], device=sim.device)
+        loss = -logp[idx, idx].mean()
+        return loss
 
     def forward(
         self,
@@ -323,82 +313,169 @@ class PreferenceCompletion(nn.Module):
         tau: torch.Tensor,         # [B,N,T,Dt]
         ctx: torch.Tensor,         # [B,N,T,Dc]
         mask: torch.Tensor,        # [B,N,T]
+        feasible_actions: Optional[torch.Tensor] = None,  # [B,N,T,M] bool
+        # episode split
         split_mode: str = "random",
         query_ratio: float = 0.3,
-        lambda_kl: float = 1.0,
-        lambda_prior: float = 1.0,
-        lambda_prec: float = 1e-3,
+        # Loss weights
+        lambda_distill_mu: float = 1.0,
+        lambda_distill_cov: float = 0.05,
+        lambda_prior: float = 0.1,
+        lambda_con: float = 0.05,
+        lambda_overlap: float = 1e-3,
+        lambda_mod: float = 1e-3,
+        # MC
         n_z_samples: int = 1,
         free_bits: float = 0.0,
+        # optional externally provided split masks
+        ctx_mask_override: Optional[torch.Tensor] = None,
+        query_mask_override: Optional[torch.Tensor] = None,
+        ensure_query_nonempty: Optional[bool] = None,
     ) -> PreferenceCompletionOutput:
-        """Run preference completion objective."""
+        """Compute PC losses."""
         B, N, T, _ = x.shape
         valid_mask = mask > 0.5
-        ctx_mask, query_mask = self.split_context_query(valid_mask.to(dtype=torch.float32), mode=split_mode, query_ratio=query_ratio)
 
+        if ctx_mask_override is not None and query_mask_override is not None:
+            ctx_mask = ctx_mask_override.to(dtype=torch.float32)
+            query_mask = query_mask_override.to(dtype=torch.float32)
+        else:
+            if ensure_query_nonempty is None:
+                ensure_query_nonempty = float(query_ratio) > 0.0
+            ctx_mask, query_mask = self.split_context_query(
+                valid_mask.to(dtype=torch.float32),
+                mode=str(split_mode),
+                query_ratio=float(query_ratio),
+                ensure_query_nonempty=bool(ensure_query_nonempty),
+            )
+
+        # evidence -> natural increments
         delta_eta, delta_L, alpha = self.evidence(x, tau, ctx, valid_mask)
 
-        post_full = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=valid_mask)
+        # teacher on full evidence (C∪Q)
+        full_mask = (ctx_mask + query_mask) > 0.5
+        full_mask = full_mask & valid_mask
+
+        post_full = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=full_mask)
         post_ctx = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=ctx_mask)
 
-        # KL terms
-        kl_full_ctx = post_full.q.kl_to(post_ctx.q)  # [B,N]
+        # agent validity (at least one token)
+        agent_valid = (valid_mask.sum(dim=-1) > 0).to(dtype=torch.float32)  # [B,N]
+
+        # ---- Query likelihood under q(z|C) ----
+        S = int(max(1, n_z_samples))
+        if S == 1:
+            z_samps = post_ctx.q.rsample().unsqueeze(0)
+        else:
+            z_samps = torch.stack([post_ctx.q.rsample() for _ in range(S)], dim=0)
+
+        query_counts = query_mask.sum(dim=-1).clamp_min(0.0)  # [B,N]
+        denom = (query_counts + 1e-6)
+
+        def nll_given_z(z_s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            dec: PrimitiveDecodeOutput = self.decoder.token_log_prob(
+                x=x,
+                tau=tau,
+                ctx=ctx,
+                mask=valid_mask.to(dtype=torch.float32),
+                feasible_actions=feasible_actions,
+                z=z_s,
+            )
+            log_pi = F.log_softmax(dec.maneuver_logits, dim=-1)
+            log_mix = torch.logsumexp(log_pi + dec.logp_x_given_m, dim=-1)  # [B,N,T]
+            # average NLL over query tokens
+            nll = -(log_mix * query_mask).sum(dim=-1) / denom
+            # modulation reg proxy (per agent)
+            mod = (dec.z_mod_delta.pow(2).sum(dim=-1) * valid_mask.to(dtype=torch.float32)).sum(dim=-1) / (valid_mask.to(dtype=torch.float32).sum(dim=-1) + 1e-6)
+            return nll, mod
+
+        nll_s = []
+        mod_s = []
+        for s in range(S):
+            nll_one, mod_one = nll_given_z(z_samps[s])
+            nll_s.append(nll_one)
+            mod_s.append(mod_one)
+        loss_query_nll = torch.stack(nll_s, dim=0).mean(dim=0)  # [B,N]
+        loss_modulation = torch.stack(mod_s, dim=0).mean(dim=0)  # [B,N]
+
+        # ---- Distillation: mean + covariance ----
+        mu_ctx = post_ctx.q.mean
+        mu_full = post_full.q.mean.detach()
+        loss_distill_mu = ((mu_ctx - mu_full) ** 2).sum(dim=-1)  # [B,N]
+
+        # KL(N(0, Σ_full)||N(0, Σ_ctx))
+        loss_distill_cov = self._kl_zero_mean_diag(post_full.q.logvar.detach(), post_ctx.q.logvar)  # [B,N]
+
+        # ---- Prior KL ----
         prior = self.prior((B, N), device=x.device, dtype=x.dtype)
-        kl_ctx_prior = post_ctx.q.kl_to(prior)  # [B,N]
+        loss_kl_ctx_prior = post_ctx.q.kl_to(prior)  # [B,N]
 
         if free_bits > 0.0:
-            # apply free-bits per dimension approximately by clamping the total KL
-            # (coarser than per-dim but prevents collapse in practice)
-            kl_full_ctx = torch.clamp(kl_full_ctx, min=free_bits * self.z_dim)
-            kl_ctx_prior = torch.clamp(kl_ctx_prior, min=free_bits * self.z_dim)
+            # clamp KL terms only
+            fb = float(free_bits) * float(self.z_dim)
+            loss_distill_cov = torch.clamp(loss_distill_cov, min=0.0)  # keep non-negative
+            loss_kl_ctx_prior = torch.clamp(loss_kl_ctx_prior, min=fb)
 
-        # Query likelihood under q(z|C∪Q)
-        # Monte Carlo over z
-        B, N, T, Dx = x.shape
-        S = int(max(1, n_z_samples))
-        z = post_full.q.rsample()  # [B,N,Dz]
-        if S > 1:
-            zs = [z]
-            for _ in range(S - 1):
-                zs.append(post_full.q.rsample())
-            z = torch.stack(zs, dim=0)  # [S,B,N,Dz]
+        # ---- Contrastive (InfoNCE) ----
+        # sample two random views from full evidence tokens
+        rnd1 = (torch.rand((B, N, T), device=x.device) < 0.5) & full_mask
+        rnd2 = (torch.rand((B, N, T), device=x.device) < 0.5) & full_mask
+        view1 = self._ensure_nonempty(full_mask.to(dtype=torch.float32), rnd1.to(dtype=torch.float32)) > 0.5
+        view2 = self._ensure_nonempty(full_mask.to(dtype=torch.float32), rnd2.to(dtype=torch.float32)) > 0.5
+        post_v1 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view1)
+        post_v2 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view2)
+        loss_contrastive = self._contrastive_loss(post_v1.q.mean, post_v2.q.mean, agent_valid)
 
-        def nll_given_z(z_s: torch.Tensor) -> torch.Tensor:
-            # z_s: [B,N,Dz]
-            mu_x, logstd_x = self.decoder(z_s, tau)
-            inv_var = torch.exp(-2.0 * logstd_x)
-            nll = 0.5 * ((x - mu_x).pow(2) * inv_var + 2.0 * logstd_x + math.log(2.0 * math.pi))
-            return nll.sum(dim=-1)  # [B,N,T]
+        # ---- Overlap penalty R_Λ ----
+        # v_t = α_t ΔΛ_t (diagonal)
+        v = (alpha.unsqueeze(-1) * delta_L) * valid_mask.unsqueeze(-1).to(dtype=delta_L.dtype)  # [B,N,T,Dz]
+        sum_v = v.sum(dim=2)  # [B,N,Dz]
+        sq_sum = (sum_v**2).sum(dim=-1)  # [B,N]
+        sq_each = (v**2).sum(dim=-1).sum(dim=2)  # [B,N]
+        overlap = 0.5 * (sq_sum - sq_each)
+        overlap = overlap.clamp_min(0.0)
+        loss_overlap = overlap  # [B,N]
 
-        if S > 1:
-            nll = torch.stack([nll_given_z(z[s]) for s in range(S)], dim=0).mean(dim=0)
-        else:
-            nll = nll_given_z(z)
-
-        loss_query_nll = masked_mean(nll, query_mask, dim=-1)  # [B,N]
-
-        # Precision increment regularizer (paper: ||ΔΛ||_F^2)
-        prec_reg = (delta_L.pow(2).sum(dim=-1))  # [B,N,T]
-        loss_prec_reg = masked_mean(prec_reg, valid_mask.to(dtype=torch.float32), dim=-1)  # [B,N]
-
-        # Total (average over valid agents)
-        agent_valid = valid_mask[..., -1].to(dtype=torch.float32)  # [B,N]
-        loss_total = (
+        # ---- Total ----
+        loss_per_agent = (
             loss_query_nll
-            + float(lambda_kl) * kl_full_ctx
-            + float(lambda_prior) * kl_ctx_prior
-            + float(lambda_prec) * loss_prec_reg
+            + float(lambda_distill_mu) * loss_distill_mu
+            + float(lambda_distill_cov) * loss_distill_cov
+            + float(lambda_prior) * loss_kl_ctx_prior
+            + float(lambda_overlap) * loss_overlap
+            + float(lambda_mod) * loss_modulation
         )
-        loss_total = masked_mean(loss_total, agent_valid)
+
+        loss_total = masked_mean(loss_per_agent, agent_valid)
+        loss_total = loss_total + float(lambda_con) * loss_contrastive
+
+        # Last-token maneuver logits under q(z|C) mean (for logging)
+        lengths = valid_mask.to(torch.int64).sum(dim=-1).clamp(min=1)  # [B,N]
+        idx = (lengths - 1).view(B, N, 1, 1)
+        tau_last = tau.gather(dim=2, index=idx.expand(B, N, 1, tau.shape[-1])).squeeze(2)
+        ctx_last = ctx.gather(dim=2, index=idx.expand(B, N, 1, ctx.shape[-1])).squeeze(2)
+        maneuver_logits_last = self.decoder.maneuver_logits_last(z=post_ctx.q.mean, tau_last=tau_last, ctx_last=ctx_last).detach()
+        if feasible_actions is not None:
+            fa_last = feasible_actions.gather(dim=2, index=idx.expand(B, N, 1, feasible_actions.shape[-1])).squeeze(2)
+            maneuver_logits_last = self.decoder.maneuver_logits_last(
+                z=post_ctx.q.mean,
+                tau_last=tau_last,
+                ctx_last=ctx_last,
+                feasible_actions_last=fa_last,
+            ).detach()
 
         return PreferenceCompletionOutput(
             post_full=post_full,
             post_ctx=post_ctx,
             ctx_mask=ctx_mask,
             query_mask=query_mask,
+            maneuver_logits_last=maneuver_logits_last,
             loss_total=loss_total,
             loss_query_nll=masked_mean(loss_query_nll, agent_valid),
-            loss_kl_full_ctx=masked_mean(kl_full_ctx, agent_valid),
-            loss_kl_ctx_prior=masked_mean(kl_ctx_prior, agent_valid),
-            loss_prec_reg=masked_mean(loss_prec_reg, agent_valid),
+            loss_distill_mu=masked_mean(loss_distill_mu, agent_valid),
+            loss_distill_cov=masked_mean(loss_distill_cov, agent_valid),
+            loss_kl_ctx_prior=masked_mean(loss_kl_ctx_prior, agent_valid),
+            loss_contrastive=loss_contrastive.detach() if torch.is_tensor(loss_contrastive) else torch.tensor(float(loss_contrastive)),
+            loss_overlap=masked_mean(loss_overlap, agent_valid),
+            loss_modulation=masked_mean(loss_modulation, agent_valid),
         )
