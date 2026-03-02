@@ -27,8 +27,7 @@ dataset:
   #   val:   ["/dataset/val"]
   train: [/coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db, /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/*.db, /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/*.db]
   val : [/coolas-shared/yusz/dataset/nuplan/data/cache/val/*.db]
-  db_files:
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db
+  db_files: /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db
 
 
   # Optional. If omitted, we will try to infer it (and create an empty folder if needed).
