@@ -26,9 +26,9 @@ dataset:
   #   train: ["/dataset/train_boston", "/dataset/train_pittsburgh", "/dataset/train_singapore"]
   #   val:   ["/dataset/val"]
   db_files:
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/
 
   # Optional. If omitted, we will try to infer it (and create an empty folder if needed).
   # nuPlan's ScenarioBuilder requires a sensor_root path even if include_cameras=false.
