@@ -6,14 +6,14 @@ dataset:
   #   /dataset/val
   #
   # Each folder should contain one or more *.db files.
-  data_root: /dataset
+  data_root: /coolas-shared/yusz/dataset/nuplan/data/cache/
 
   # Your maps directory layout (either of the following is supported):
   #   (A) /maps/nuplan-maps-v1.0/<city>/<version>/map.gpkg
   #   (B) /maps/<city>/<version>/map.gpkg
   #
   # If you use (B), set map_version: "" (empty).
-  map_root: /maps
+  map_root: /coolas-shared/yusz/dataset/nuplan/dataset/maps/
   map_version: ""   # "" if maps are stored directly under map_root/<city>/<version>/
 
   # Explicit DB locations. Can be:
@@ -26,9 +26,9 @@ dataset:
   #   train: ["/dataset/train_boston", "/dataset/train_pittsburgh", "/dataset/train_singapore"]
   #   val:   ["/dataset/val"]
   db_files:
-    - /dataset/train_boston
-    - /dataset/train_pittsburgh
-    - /dataset/train_singapore
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore
 
   # Optional. If omitted, we will try to infer it (and create an empty folder if needed).
   # nuPlan's ScenarioBuilder requires a sensor_root path even if include_cameras=false.
