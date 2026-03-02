@@ -135,7 +135,7 @@ def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilt
                 if int(max_workers) <= 1:
                     pool = SequentialWorkerPool()
                 else:
-                    pool = MultiProcessWorkerPool(worker=int(max_workers))
+                    pool = MultiProcessWorkerPool(num_workers=int(max_workers))
                 with pool:
                     return builder.get_scenarios(scenario_filter, worker_pool=pool)
             except Exception:
@@ -146,7 +146,7 @@ def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilt
 
     # 3) last resort: try num_workers kwarg
     try:
-        return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
+        return builder.get_scenarios(scenario_filter, worker=int(max_workers))
     except Exception as e:
         # If nothing works, re-raise the original error by calling the plain API.
         return builder.get_scenarios(scenario_filter)
