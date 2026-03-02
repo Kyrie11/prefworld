@@ -137,71 +137,67 @@ def _build_pool(num_workers: int):
     return SingleMachineParallelExecutor(**kwargs)
 
 
-def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilter, max_workers: int = 4):
-    """Call NuPlanScenarioBuilder.get_scenarios with best-effort parallelism.
+def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
+    """
+    Call NuPlanScenarioBuilder.get_scenarios across different nuplan-devkit APIs.
 
-    nuPlan devkit versions differ in how worker pools are passed (e.g. `worker`, `worker_pool`,
-    `num_workers`). We inspect the signature and try the compatible call path.
+    Handles variants:
+      - get_scenarios(filter, worker=pool)   (worker required)
+      - get_scenarios(filter, worker_pool=pool)
+      - get_scenarios(filter, num_workers=K)
+      - get_scenarios(filter)  (no parallelism)
+    Also handles pool lifecycle when pool is NOT a context manager.
     """
     import inspect
+
+    def _start_pool(pool):
+        # Different versions use different start semantics
+        if hasattr(pool, "start") and callable(getattr(pool, "start")):
+            pool.start()
+
+    def _stop_pool(pool):
+        # Try common shutdown/close/stop/terminate names
+        for name in ("shutdown", "close", "stop", "terminate", "join"):
+            if hasattr(pool, name) and callable(getattr(pool, name)):
+                try:
+                    getattr(pool, name)()
+                except TypeError:
+                    # some methods require args; ignore
+                    pass
+                break
 
     sig = inspect.signature(builder.get_scenarios)
     params = sig.parameters
 
-    # Helper: build a WorkerPool if nuplan provides it
-    def _build_pool(num_workers: int):
-        """Build a compatible worker/worker_pool for different nuplan-devkit versions."""
-        import inspect
-
-        # 1) Prefer SingleMachineParallelExecutor (most common across versions)
-        try:
-            from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
-        except ImportError:
-            # some forks put it here
-            from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor
-
-        sig = inspect.signature(SingleMachineParallelExecutor.__init__)
-        params = sig.parameters
-
-        n = int(num_workers)
-        kwargs = {}
-
-        # common arg names across forks/versions
-        if "max_workers" in params:
-            kwargs["max_workers"] = n
-        elif "num_workers" in params:
-            kwargs["num_workers"] = n
-
-        if "use_process_pool" in params:
-            kwargs["use_process_pool"] = (n > 1)
-        if "use_thread_pool" in params:
-            kwargs["use_thread_pool"] = True
-
-        return SingleMachineParallelExecutor(**kwargs)
-
-    # 1) Newer devkit: get_scenarios(filter, worker=pool) or get_scenarios(filter, worker)
+    # 1) Version where worker is required (your earlier报错就是这个)
     if "worker" in params:
         pool = _build_pool(max_workers)
-        with pool:
+        _start_pool(pool)
+        try:
+            # Prefer keyword, but some versions are positional-only
             try:
                 return builder.get_scenarios(scenario_filter, worker=pool)
             except TypeError:
-                # some signatures are positional-only
                 return builder.get_scenarios(scenario_filter, pool)
+        finally:
+            _stop_pool(pool)
 
-    # 2) Older devkit: get_scenarios(filter, worker_pool=pool)
+    # 2) Version where worker_pool is used
     if "worker_pool" in params:
         pool = _build_pool(max_workers)
-        with pool:
+        _start_pool(pool)
+        try:
             return builder.get_scenarios(scenario_filter, worker_pool=pool)
+        finally:
+            _stop_pool(pool)
 
-    # 3) Keyword-based parallelism in some versions
+    # 3) Version where only number of workers is accepted
     if "num_workers" in params:
         return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
     if "num_worker" in params:
         return builder.get_scenarios(scenario_filter, num_worker=int(max_workers))
 
-    # 4) simplest (no parallelism support)
+    # 4) No parallelism support
     return builder.get_scenarios(scenario_filter)
 
 
