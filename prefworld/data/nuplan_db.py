@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
-from nuplan.planning.scenario_builder.scenario_filter import ScenaioFilter
+from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 
 
 PathLike = Union[str, Path]
