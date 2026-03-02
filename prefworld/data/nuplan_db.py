@@ -145,8 +145,34 @@ def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
     from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
 
     def _build_pool(num_workers: int):
-        """Build a pool with SingleMachineParallelExecutor"""
-        return SingleMachineParallelExecutor(num_workers=num_workers)
+        """Build a compatible worker/worker_pool for different nuplan-devkit versions."""
+        import inspect
+
+        # 1) Prefer SingleMachineParallelExecutor (most common across versions)
+        try:
+            from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
+        except ImportError:
+            # some forks put it here
+            from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor
+
+        sig = inspect.signature(SingleMachineParallelExecutor.__init__)
+        params = sig.parameters
+
+        n = int(num_workers)
+        kwargs = {}
+
+        # common arg names across forks/versions
+        if "max_workers" in params:
+            kwargs["max_workers"] = n
+        elif "num_workers" in params:
+            kwargs["num_workers"] = n
+
+        if "use_process_pool" in params:
+            kwargs["use_process_pool"] = (n > 1)
+        if "use_thread_pool" in params:
+            kwargs["use_thread_pool"] = True
+
+        return SingleMachineParallelExecutor(**kwargs)
 
     # Get signature of get_scenarios
     sig = inspect.signature(builder.get_scenarios)
