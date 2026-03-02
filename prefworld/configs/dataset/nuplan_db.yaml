@@ -26,10 +26,11 @@ dataset:
   #   train: ["/dataset/train_boston", "/dataset/train_pittsburgh", "/dataset/train_singapore"]
   #   val:   ["/dataset/val"]
   train: [/coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/, /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/, /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/]
+  val : [/coolas-shared/yusz/dataset/nuplan/data/cache/val/*.db]
   db_files:
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/
-    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/*.db
+    - /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/*.db
 
   # Optional. If omitted, we will try to infer it (and create an empty folder if needed).
   # nuPlan's ScenarioBuilder requires a sensor_root path even if include_cameras=false.
@@ -46,7 +47,7 @@ dataset:
   limit_total_scenarios: null
 
   # Cache output
-  cache_dir: /coolas-shared/yusz/dataset/nuplan/data/preworld
+  cache_dir: /coolas-shared/yusz/dataset/nuplan/data/prefworld
   split: train
 
   # Sampling inside each scenario (iterations)
