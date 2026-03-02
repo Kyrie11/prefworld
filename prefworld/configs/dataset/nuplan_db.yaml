@@ -15,7 +15,14 @@ dataset:
   # If you use (B), set map_version: "" (empty).
   map_root: /coolas-shared/yusz/dataset/nuplan/dataset/maps/
   map_version: ""   # "" if maps are stored directly under map_root/<city>/<version>/
-
+  map_names:
+    - sg-one-north
+    - us-ma-boston
+    - us-nv-las-vegas-strip
+    - us-pa-pittsburgh-hazelwood
+  timestamp_threshold_s: null
+  ego_displacement_minimum_m: 5.0
+  remove_invalid_goals: true
   # Explicit DB locations. Can be:
   #  - a directory (will discover *.db inside)
   #  - a single *.db file
@@ -27,7 +34,10 @@ dataset:
   #   val:   ["/dataset/val"]
   train: [/coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db, /coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/*.db, /coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/*.db]
   val : [/coolas-shared/yusz/dataset/nuplan/data/cache/val/*.db]
-  db_files: /coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db
+  db_files:
+    - "/coolas-shared/yusz/dataset/nuplan/data/cache/train_boston/*.db"
+    - "/coolas-shared/yusz/dataset/nuplan/data/cache/train_pittsburgh/*.db"
+    - "/coolas-shared/yusz/dataset/nuplan/data/cache/train_singapore/*.db"
 
 
   # Optional. If omitted, we will try to infer it (and create an empty folder if needed).
@@ -78,12 +88,3 @@ dataset:
     lateral_threshold_m: 2.0
     turn_threshold_rad: 0.4
 
-ScenarioFilter:
-  map_names:
-    - sg-one-north
-    - us-ma-boston
-    - us-nv-las-vegas-strip
-    - us-pa-pittsburgh-hazelwood
-  timestamp_threshold_s: 5.0
-  ego_displacement_minimum_m: 1.0
-  remove_invalid_goals: true

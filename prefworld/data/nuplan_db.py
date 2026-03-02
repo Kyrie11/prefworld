@@ -178,6 +178,10 @@ class NuPlanDataConfig:
     num_scenarios_per_type: Optional[int] = None
     limit_total_scenarios: Optional[int] = None
 
+    map_names: Optional[List[str]] = None
+    timestamp_threshold_s: Optional[float] = None
+    ego_displacement_minimum_m: Optional[float] = None
+    remove_invalid_goals: bool = True
 
 def build_scenarios(cfg: NuPlanDataConfig):
     """Build a list of nuPlan scenarios according to cfg."""
@@ -204,6 +208,10 @@ def build_scenarios(cfg: NuPlanDataConfig):
         scenario_types=cfg.scenario_types,
         scenario_tokens=cfg.scenario_tokens,
         log_names=cfg.log_names,
+        map_names=cfg.map_names,
+        timestamp_threshold_s=cfg.timestamp_threshold_s,
+        ego_displacement_minimum_m=cfg.ego_displacement_minimum_m,
+        remove_invalid_goals=cfg.remove_invalid_goals,
         shuffle=cfg.shuffle,
         expand_scenarios=cfg.expand_scenarios,
         num_scenarios_per_type=cfg.num_scenarios_per_type,

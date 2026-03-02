@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import glob
 import argparse
 import os
 from dataclasses import asdict
@@ -53,6 +53,10 @@ def main() -> None:
         scenario_types=cfg.dataset.get("scenario_types", None),
         scenario_tokens=cfg.dataset.get("scenario_tokens", None),
         log_names=cfg.dataset.get("log_names", None),
+        map_names=cfg.dataset.get("map_names", None),
+        timestamp_threshold_s=cfg.dataset.get("timestamp_threshold_s", None),
+        ego_displacement_minimum_m=cfg.dataset.get("ego_displacement_minimum_m", None),
+        remove_invalid_goals=bool(cfg.dataset.get("remove_invalid_goals", True)),
         shuffle=bool(cfg.dataset.get("shuffle", True)),
         expand_scenarios=bool(cfg.dataset.get("expand_scenarios", False)),
         num_scenarios_per_type=cfg.dataset.get("num_scenarios_per_type", None),
