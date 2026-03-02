@@ -77,3 +77,9 @@ dataset:
     stop_dist_threshold_m: 1.0
     lateral_threshold_m: 2.0
     turn_threshold_rad: 0.4
+
+ScenarioFilter:
+  map_names: ["map1", "map2"]  # 设置使用的地图名称
+  timestamp_threshold_s: 5.0     # 时间戳阈值为5秒
+  ego_displacement_minimum_m: 1.0 # 自车的最小位移为1米
+  remove_invalid_goals: true     # 移除无效目标
