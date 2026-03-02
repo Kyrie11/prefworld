@@ -41,12 +41,17 @@ def main() -> None:
     out_dir = cache_dir / split / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    db_files = []
+    for folder in ['train_boston', 'train_pittsburgh', 'train_singapore']:
+        folder_path = Path(f'/coolas-shared/yusz/dataset/nuplan/data/cache/{folder}')
+        db_files.extend(list(folder_path.glob('*.db')))
+
     # Build scenarios
     data_cfg = NuPlanDataConfig(
         data_root=str(cfg.dataset.data_root),
         map_root=str(cfg.dataset.map_root),
         map_version=str(cfg.dataset.map_version),
-        db_files=cfg.dataset.get("db_files", None),
+        db_files=db_files,
         sensor_root=cfg.dataset.get("sensor_root", None),
         include_cameras=False,
         max_workers=int(cfg.dataset.max_workers),
