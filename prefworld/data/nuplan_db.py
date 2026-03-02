@@ -110,46 +110,53 @@ def _resolve_map_version(map_root: str, map_version: str) -> str:
 def _get_scenarios(builder: NuPlanScenarioBuilder, scenario_filter: ScenarioFilter, max_workers: int = 4):
     """Call NuPlanScenarioBuilder.get_scenarios with best-effort parallelism.
 
-    nuPlan devkit versions differ in how worker pools are passed. We try a few common patterns and
-    fall back to a plain call for maximum compatibility.
+    nuPlan devkit versions differ in how worker pools are passed (e.g. `worker`, `worker_pool`,
+    `num_workers`). We inspect the signature and try the compatible call path.
     """
-    # 1) simplest
-    try:
-        return builder.get_scenarios(scenario_filter)
-    except TypeError:
-        pass
+    import inspect
 
-    # 2) try a worker_pool kwarg if present
-    try:
-        import inspect
-        sig = inspect.signature(builder.get_scenarios)
-        if "worker_pool" in sig.parameters:
-            # Try to build a sequential / multiprocessing pool if available.
+    sig = inspect.signature(builder.get_scenarios)
+    params = sig.parameters
+
+    # Helper: build a WorkerPool if nuplan provides it
+    def _build_pool(num_workers: int):
+        from nuplan.planning.utils.multithreading.worker_pool import (
+            WorkerPool,
+            SequentialWorkerPool,
+            MultiProcessWorkerPool,
+        )
+        pool: WorkerPool
+        if int(num_workers) <= 1:
+            pool = SequentialWorkerPool()
+        else:
+            pool = MultiProcessWorkerPool(num_workers=int(num_workers))
+        return pool
+
+    # 1) Newer devkit: get_scenarios(filter, worker=pool) or get_scenarios(filter, worker)
+    if "worker" in params:
+        pool = _build_pool(max_workers)
+        with pool:
             try:
-                from nuplan.planning.utils.multithreading.worker_pool import (
-                    WorkerPool,
-                    SequentialWorkerPool,
-                    MultiProcessWorkerPool,
-                )
-                pool: WorkerPool
-                if int(max_workers) <= 1:
-                    pool = SequentialWorkerPool()
-                else:
-                    pool = MultiProcessWorkerPool(num_workers=int(max_workers))
-                with pool:
-                    return builder.get_scenarios(scenario_filter, worker_pool=pool)
-            except Exception:
-                # fallback: call without pool
-                return builder.get_scenarios(scenario_filter)
-    except Exception:
-        pass
+                return builder.get_scenarios(scenario_filter, worker=pool)
+            except TypeError:
+                # some signatures are positional-only
+                return builder.get_scenarios(scenario_filter, pool)
 
-    # 3) last resort: try num_workers kwarg
-    try:
+    # 2) Older devkit: get_scenarios(filter, worker_pool=pool)
+    if "worker_pool" in params:
+        pool = _build_pool(max_workers)
+        with pool:
+            return builder.get_scenarios(scenario_filter, worker_pool=pool)
+
+    # 3) Keyword-based parallelism in some versions
+    if "num_workers" in params:
+        return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
+    if "num_worker" in params:
         return builder.get_scenarios(scenario_filter, num_worker=int(max_workers))
-    except Exception as e:
-        # If nothing works, re-raise the original error by calling the plain API.
-        return builder.get_scenarios(scenario_filter)
+
+    # 4) simplest (no parallelism support)
+    return builder.get_scenarios(scenario_filter)
+
 
 
 @dataclass
