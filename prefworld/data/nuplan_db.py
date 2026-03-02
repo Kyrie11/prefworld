@@ -142,7 +142,6 @@ def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
     Call NuPlanScenarioBuilder.get_scenarios with parallelism and skip malformed DBs.
     """
     import inspect
-    from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
 
     def _build_pool(num_workers: int):
         """Build a compatible worker/worker_pool for different nuplan-devkit versions."""
