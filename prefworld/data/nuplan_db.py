@@ -139,67 +139,38 @@ def _build_pool(num_workers: int):
 
 def _get_scenarios(builder, scenario_filter, max_workers: int = 4):
     """
-    Call NuPlanScenarioBuilder.get_scenarios across different nuplan-devkit APIs.
-
-    Handles variants:
-      - get_scenarios(filter, worker=pool)   (worker required)
-      - get_scenarios(filter, worker_pool=pool)
-      - get_scenarios(filter, num_workers=K)
-      - get_scenarios(filter)  (no parallelism)
-    Also handles pool lifecycle when pool is NOT a context manager.
+    Call NuPlanScenarioBuilder.get_scenarios with parallelism and skip malformed DBs.
     """
     import inspect
+    from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
 
-    def _start_pool(pool):
-        # Different versions use different start semantics
-        if hasattr(pool, "start") and callable(getattr(pool, "start")):
-            pool.start()
+    def _build_pool(num_workers: int):
+        """Build a pool with SingleMachineParallelExecutor"""
+        return SingleMachineParallelExecutor(num_workers=num_workers)
 
-    def _stop_pool(pool):
-        # Try common shutdown/close/stop/terminate names
-        for name in ("shutdown", "close", "stop", "terminate", "join"):
-            if hasattr(pool, name) and callable(getattr(pool, name)):
-                try:
-                    getattr(pool, name)()
-                except TypeError:
-                    # some methods require args; ignore
-                    pass
-                break
-
+    # Get signature of get_scenarios
     sig = inspect.signature(builder.get_scenarios)
     params = sig.parameters
 
-    # 1) Version where worker is required (your earlier报错就是这个)
+    pool = _build_pool(max_workers)
+
+    def _process_file(local_log_file_absolute_path):
+        """Process a single DB file with error handling for malformed DBs"""
+        try:
+            return get_scenarios_from_db_file(local_log_file_absolute_path)
+        except sqlite3.DatabaseError as e:
+            print(f"[SKIP] malformed db: {local_log_file_absolute_path} error={e}", flush=True)
+            return []  # Skip this DB file and continue
+
     if "worker" in params:
-        pool = _build_pool(max_workers)
-        _start_pool(pool)
-        try:
-            # Prefer keyword, but some versions are positional-only
-            try:
-                return builder.get_scenarios(scenario_filter, worker=pool)
-            except TypeError:
-                return builder.get_scenarios(scenario_filter, pool)
-        finally:
-            _stop_pool(pool)
+        # Use the worker pool in the get_scenarios call
+        with pool:
+            scenario_dict = builder.get_scenarios(scenario_filter, worker=pool, process_file=_process_file)
+    else:
+        # Fallback for versions that don't use worker
+        scenario_dict = builder.get_scenarios(scenario_filter)
 
-    # 2) Version where worker_pool is used
-    if "worker_pool" in params:
-        pool = _build_pool(max_workers)
-        _start_pool(pool)
-        try:
-            return builder.get_scenarios(scenario_filter, worker_pool=pool)
-        finally:
-            _stop_pool(pool)
-
-    # 3) Version where only number of workers is accepted
-    if "num_workers" in params:
-        return builder.get_scenarios(scenario_filter, num_workers=int(max_workers))
-    if "num_worker" in params:
-        return builder.get_scenarios(scenario_filter, num_worker=int(max_workers))
-
-    # 4) No parallelism support
-    return builder.get_scenarios(scenario_filter)
-
+    return scenario_dict
 
 
 @dataclass
