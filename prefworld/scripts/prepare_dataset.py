@@ -69,8 +69,6 @@ def main() -> None:
         limit_total_scenarios=cfg.dataset.get("limit_total_scenarios", None),
     )
 
-    print("map_root =", data_cfg.map_root)
-    print("map_version =", repr(data_cfg.map_version))
     scenarios = build_scenarios(data_cfg)
 
     ext_cfg = ExtractionConfig(**cfg.dataset.extraction)
