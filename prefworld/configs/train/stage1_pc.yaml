@@ -3,7 +3,7 @@ device: cuda
 
 # Cached samples OR cached episodes. Stage-1 uses only preference completion.
 dataset:
-  cache_dir: /path/to/cache/prefworld_train
+  cache_dir: /coolas-shared/yusz/dataset/nuplan/data/cache/prefworld_train
   split: train
   kind: samples          # samples | episodes
   max_samples: null
