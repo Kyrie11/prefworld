@@ -141,7 +141,7 @@ def main() -> None:
             sample = extract_sample(sc, it, ext_cfg, include_future_agents=True)
 
             # 用“临时文件+原子替换”写入，避免写到一半崩了留下坏文件
-            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path = path.with_suffix(".tmp.npz")
             save_npz(tmp_path, sample)
             os.replace(tmp_path, path)
 
