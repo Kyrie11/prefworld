@@ -31,13 +31,13 @@ def _log_name(scenario) -> str:
 
 
 def main() -> None:
-    print("map_root =", data_cfg.map_root)
-    print("map_version =", repr(data_cfg.map_version))
+
     parser = make_argparser("Prepare nuPlan DB -> cached training samples (no sensors)")
     args, unknown = parser.parse_known_args()
     overrides = parse_overrides(unknown)
     cfg = load_config(args.config, overrides)
-
+    print("map_root =",cfg.map_root)
+    print("map_version =", repr(cfg.map_version))
     split = str(cfg.dataset.split)
     cache_dir = Path(cfg.dataset.cache_dir)
     out_dir = cache_dir / split / "samples"
