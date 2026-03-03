@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
-from prefworld.data.cache import CachedSampleIndex, save_npz, write_index_jsonl
+from prefworld.data.cache import CachedSampleIndex, save_npz, write_index_jsonl, read_index_jsonl
 from prefworld.data.extractor import ExtractionConfig, extract_sample
 from prefworld.data.nuplan_db import NuPlanDataConfig, build_scenarios
 from prefworld.utils.config import load_config, make_argparser, parse_overrides
@@ -78,6 +78,15 @@ def main() -> None:
     max_total = cfg.dataset.get("max_total_samples", None)
 
     index_items: List[CachedSampleIndex] = []
+    processed = set()
+
+    index_path = cache_dir / split / "index.jsonl"
+    if index_path.exists():
+        existing_items = read_index_jsonl(index_path)
+        index_items.extend(existing_items)
+        for it in existing_items:
+            processed.add((it.log_name, it.scenario_token, int(it.iteration)))
+
     total_written = 0
 
     for sc in tqdm(scenarios, desc=f"Extracting {split}"):
@@ -98,10 +107,37 @@ def main() -> None:
             its = its[: int(max_per_scenario)]
 
         for it in its:
-            sample = extract_sample(sc, it, ext_cfg, include_future_agents=True)
+            key = (log_name, token, int(it))
             filename = f"{log_name}__{token}__it{it:05d}.npz"
             path = out_dir / filename
-            save_npz(path, sample)
+
+            # 断点续跑：如果 index 里已经记录过，且文件也存在，直接跳过
+            if key in processed and path.exists():
+                continue
+
+            # 即便 index 没记录，但文件已经存在，也跳过（防止 index 丢失导致重复覆盖）
+            if path.exists():
+                # 可选：如果你希望把缺失的 index 补上，可以把这条加回 index_items
+                if key not in processed:
+                    index_items.append(
+                        CachedSampleIndex(
+                            path=str(path),
+                            log_name=log_name,
+                            scenario_token=token,
+                            iteration=int(it),
+                        )
+                    )
+                    processed.add(key)
+                continue
+
+            # 正常生成新样本
+            sample = extract_sample(sc, it, ext_cfg, include_future_agents=True)
+
+            # 用“临时文件+原子替换”写入，避免写到一半崩了留下坏文件
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            save_npz(tmp_path, sample)
+            os.replace(tmp_path, path)
+
             index_items.append(
                 CachedSampleIndex(
                     path=str(path),
@@ -110,15 +146,20 @@ def main() -> None:
                     iteration=int(it),
                 )
             )
+            processed.add(key)
+
             total_written += 1
             if max_total is not None and total_written >= int(max_total):
                 break
+
         if max_total is not None and total_written >= int(max_total):
             break
 
     # Write index
     index_path = cache_dir / split / "index.jsonl"
-    write_index_jsonl(index_path, index_items)
+    tmp_index_path = index_path.with_suffix(index_path.suffix + ".tmp")
+    write_index_jsonl(tmp_index_path, index_items)
+    os.replace(tmp_index_path, index_path)
 
     # Save a copy of the effective config for reproducibility
     (cache_dir / split).mkdir(parents=True, exist_ok=True)
