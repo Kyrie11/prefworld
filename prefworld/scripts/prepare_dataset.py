@@ -89,7 +89,14 @@ def main() -> None:
 
     total_written = 0
 
-    for sc in tqdm(scenarios, desc=f"Extracting {split}"):
+    existing_items = read_index_jsonl(index_path) if index_path.exists() else []
+    total_processed = len(existing_items)
+    # 初始化进度条，跳过已处理部分
+    scenarios = build_scenarios(data_cfg)
+    total_scenarios = len(scenarios)
+    progress_bar = tqdm(scenarios, desc=f"Extracting {split}", initial=total_processed, total=total_scenarios)
+
+    for sc in progress_bar:
         token = _scenario_token(sc)
         log_name = _log_name(sc)
         n_it = int(sc.get_number_of_iterations())
@@ -149,6 +156,7 @@ def main() -> None:
             processed.add(key)
 
             total_written += 1
+            progress_bar.update(1)
             if max_total is not None and total_written >= int(max_total):
                 break
         if max_total is not None and total_written >= int(max_total):
