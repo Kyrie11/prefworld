@@ -13,8 +13,8 @@ dataset:
   #   (B) /maps/<city>/<version>/map.gpkg
   #
   # If you use (B), set map_version: "" (empty).
-  map_root: /coolas-shared/yusz/dataset/nuplan/maps/nuplan-maps-v1.0
-  map_version: "nuplan-maps-v1.0"   # "" if maps are stored directly under map_root/<city>/<version>/
+  map_root: /coolas-shared/yusz/dataset/nuplan/maps
+  map_version: ""   # "" if maps are stored directly under map_root/<city>/<version>/
   map_names:
     - sg-one-north
     - us-ma-boston
