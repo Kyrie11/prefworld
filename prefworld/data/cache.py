@@ -34,10 +34,8 @@ def read_index_jsonl(path: Path) -> List[CachedSampleIndex]:
     return items
 
 
-def save_npz(path: Path, sample: Dict[str, np.ndarray], overwrite: bool = True) -> None:
+def save_npz(path: Path, sample: Dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if (not overwrite) and path.exists():
-        return
     np.savez_compressed(path, **sample)
 
 
