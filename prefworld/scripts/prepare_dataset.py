@@ -36,8 +36,7 @@ def main() -> None:
     args, unknown = parser.parse_known_args()
     overrides = parse_overrides(unknown)
     cfg = load_config(args.config, overrides)
-    print("map_root =",cfg.map_root)
-    print("map_version =", repr(cfg.map_version))
+
     split = str(cfg.dataset.split)
     cache_dir = Path(cfg.dataset.cache_dir)
     out_dir = cache_dir / split / "samples"
@@ -69,6 +68,9 @@ def main() -> None:
         num_scenarios_per_type=cfg.dataset.get("num_scenarios_per_type", None),
         limit_total_scenarios=cfg.dataset.get("limit_total_scenarios", None),
     )
+
+    print("map_root =", data_cfg.map_root)
+    print("map_version =", repr(data_cfg.map_version))
     scenarios = build_scenarios(data_cfg)
 
     ext_cfg = ExtractionConfig(**cfg.dataset.extraction)
