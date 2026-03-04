@@ -169,8 +169,8 @@ def main() -> None:
 
             bad_keys = find_nonfinite(batch)
             if bad_keys:
-                print("Non-finite in batch keys:", bad_keys)
-                print("meta:", batch["_meta"])
+                # print("Non-finite in batch keys:", bad_keys)
+                # print("meta:", batch["_meta"])
                 # 可选：直接跳过这个 batch，避免污染权重
                 continue
             # Encode templates once so we can build cross-template splits.
@@ -227,8 +227,8 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             if not torch.isfinite(loss):
-                print("LOSS NON-FINITE!", loss)
-                print("meta:", batch["_meta"])
+                # print("LOSS NON-FINITE!", loss)
+                # print("meta:", batch["_meta"])
                 for name, t in out.losses.items():
                     if torch.is_tensor(t) and not torch.isfinite(t):
                         print("  bad loss:", name, t)
