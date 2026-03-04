@@ -36,7 +36,9 @@ class CachedNuPlanDataset(Dataset):
                 if v.dtype.kind in ("i", "u"):
                     out[k] = torch.from_numpy(v.astype(np.int64))
                 else:
-                    out[k] = torch.from_numpy(v.astype(np.float32))
+                    arr = v.astype(np.float32)
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                    out[k] = torch.from_numpy(arr)
             else:
                 out[k] = v
         # metadata (not tensor)
