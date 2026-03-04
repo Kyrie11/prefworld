@@ -231,7 +231,8 @@ def main() -> None:
                 # print("meta:", batch["_meta"])
                 for name, t in out.losses.items():
                     if torch.is_tensor(t) and not torch.isfinite(t):
-                        print("  bad loss:", name, t)
+                        # print("  bad loss:", name, t)
+                        pass
                 continue
 
             loss.backward()
