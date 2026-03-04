@@ -158,7 +158,16 @@ def main() -> None:
 
         for step, batch in enumerate(pbar):
             batch = _move_to_device(batch, device)
-
+            # 在 move_to_device 之前检查（CPU 更快定位）
+            for k, v in batch.items():
+                if torch.is_tensor(v) and v.dtype.is_floating_point:
+                    if not torch.isfinite(v).all():
+                        bad = (~torch.isfinite(v)).sum().item()
+                        print(f"[BAD] {k}: non-finite count = {bad}, shape={tuple(v.shape)}")
+                        # 可选：打印一个具体位置
+                        idx = torch.nonzero(~torch.isfinite(v), as_tuple=False)[0].tolist()
+                        print(f" first bad index={idx}, value={v[tuple(idx)].item()}")
+                        raise SystemExit
             # Encode templates once so we can build cross-template splits.
             with torch.set_grad_enabled(True):
                 template_out, state_all, _ = model.encode_templates(batch)
