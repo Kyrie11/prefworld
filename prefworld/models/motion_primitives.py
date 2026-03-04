@@ -380,6 +380,7 @@ class FrenetMarginalEmission(nn.Module):
 
         mu_xi = self.mu_xi_base.view(1, 1, 1, self.num_maneuvers, 2) + dmu
         logvar_xi = self.logvar_xi_base.view(1, 1, 1, self.num_maneuvers, 2) + dlogvar
+        logvar_xi = logvar_xi.clamp(min=-10.0, max=10.0)
         logstd_noise = (self.logstd_noise_base.view(1, 1, 1, self.num_maneuvers, 3) + dlogstd_noise).clamp(
             min=self.min_logstd, max=self.max_logstd
         )
@@ -519,10 +520,20 @@ class MotionPrimitiveDecoder(nn.Module):
             logp = self._log_prob_diag_normal(x_e, mean, logstd)  # [B,N,T,M]
 
         # mask invalid tokens
-        logp = logp * m.unsqueeze(-1).to(dtype=logp.dtype)
-        logits = logits.masked_fill(~m.unsqueeze(-1), 0.0)
-        z_mod = z_mod * m.unsqueeze(-1).to(dtype=z_mod.dtype)
-        z_delta = z_delta * m.unsqueeze(-1).to(dtype=z_delta.dtype)
+        m_e = m.unsqueeze(-1)
+
+        # 先把 logp 里的非有限数清掉（可选但非常稳）
+        logp = torch.nan_to_num(logp, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 用 masked_fill 而不是乘 mask（NaN*0 仍是 NaN）
+        logp = logp.masked_fill(~m_e, 0.0)
+
+        # logits 这行保留
+        logits = logits.masked_fill(~m_e, 0.0)
+
+        # z_mod / z_delta 同理
+        z_mod = z_mod.masked_fill(~m_e, 0.0)
+        z_delta = z_delta.masked_fill(~m_e, 0.0)
 
         return PrimitiveDecodeOutput(maneuver_logits=logits, logp_x_given_m=logp, z_mod=z_mod, z_mod_delta=z_delta)
 

@@ -159,20 +159,7 @@ def main() -> None:
         for step, batch in enumerate(pbar):
             batch = _move_to_device(batch, device)
             # 在 move_to_device 之前检查（CPU 更快定位）
-            def find_nonfinite(batch):
-                bad = []
-                for k, v in batch.items():
-                    if torch.is_tensor(v) and v.is_floating_point():
-                        if not torch.isfinite(v).all():
-                            bad.append(k)
-                return bad
 
-            bad_keys = find_nonfinite(batch)
-            if bad_keys:
-                print("Non-finite in batch keys:", bad_keys)
-                print("meta:", batch["_meta"])
-                # 可选：直接跳过这个 batch，避免污染权重
-                continue
 
             # Encode templates once so we can build cross-template splits.
             with torch.set_grad_enabled(True):
@@ -225,15 +212,12 @@ def main() -> None:
 
             loss = out.losses["loss_pc"]
 
-            optimizer.zero_grad(set_to_none=True)
-
             if not torch.isfinite(loss):
-                print("LOSS NON-FINITE!", loss)
-                print("meta:", batch["_meta"])
-                for name, t in out.losses.items():
-                    if torch.is_tensor(t) and not torch.isfinite(t):
-                        print("  bad loss:", name, t)
+                print("Skip step due to non-finite loss. meta=", batch.get("_meta", None))
+                optimizer.zero_grad(set_to_none=True)
                 continue
+
+            optimizer.zero_grad(set_to_none=True)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(tcfg.get("grad_clip_norm", 5.0)))

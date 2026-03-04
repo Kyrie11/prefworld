@@ -383,8 +383,12 @@ class PreferenceCompletion(nn.Module):
             )
             log_pi = F.log_softmax(dec.maneuver_logits, dim=-1)
             log_mix = torch.logsumexp(log_pi + dec.logp_x_given_m, dim=-1)  # [B,N,T]
+            log_mix = torch.nan_to_num(log_mix, nan=0.0, posinf=0.0, neginf=0.0)
             # average NLL over query tokens
-            nll = -(log_mix * query_mask).sum(dim=-1) / denom
+            # 把 query_mask=0 的位置显式置零，避免 NaN*0 仍 NaN
+            qm = query_mask > 0.5
+            log_mix_q = log_mix.masked_fill(~qm, 0.0)
+            nll = -(log_mix_q).sum(dim=-1) / denom
             # modulation reg proxy (per agent)
             mod = (dec.z_mod_delta.pow(2).sum(dim=-1) * valid_mask.to(dtype=torch.float32)).sum(dim=-1) / (valid_mask.to(dtype=torch.float32).sum(dim=-1) + 1e-6)
             return nll, mod
