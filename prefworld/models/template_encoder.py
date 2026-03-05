@@ -269,7 +269,32 @@ class TemplateEncoder(nn.Module):
         eye = torch.eye(N, device=agents_state.device, dtype=torch.bool).unsqueeze(0).unsqueeze(2)
         not_self = ~eye.expand(B, N, T, N)
         conflict_mask = conflict & valid_i & valid_j & not_self
-        conflict_region_id = conflict_mask.to(torch.int64)
+
+        # ------------------------------------------------------------------
+        # Conflict region id: map-aware proxy (improves interaction region representation)
+        # ------------------------------------------------------------------
+        # We use the most-attended lane connector polyline as a stable "interaction region" id.
+        # This augments the purely geometric closest-approach test.
+        #   0: no conflict
+        #   1: geometric conflict (no shared region)
+        #   >=2: shared lane-connector id (polyline index + 2)
+        if map_poly_type is None:
+            map_poly_type = torch.zeros((B, map_polylines.shape[1]), device=agents_state.device, dtype=torch.long)
+
+        top_poly = attn.argmax(dim=-1).to(torch.long)  # [B,N,T]
+        poly_type_top = map_poly_type.gather(1, top_poly.reshape(B, -1)).reshape(B, N, T)  # [B,N,T]
+        region_poly = torch.where(poly_type_top == 1, top_poly + 2, torch.zeros_like(top_poly))  # [B,N,T]
+
+        region_i = region_poly.unsqueeze(-1)                     # [B,N,T,1]
+        region_j = region_poly.permute(0, 2, 1).unsqueeze(1)     # [B,1,T,N]
+        share_region = (region_i == region_j) & (region_i > 0) & valid_i & valid_j & not_self
+
+        # Treat shared connector as a (soft) conflict cue
+        conflict_mask = conflict_mask | share_region
+
+        conflict_region_id = torch.zeros((B, N, T, N), device=agents_state.device, dtype=torch.int64)
+        conflict_region_id = torch.where(share_region, region_i.expand_as(conflict_region_id), conflict_region_id)
+        conflict_region_id = torch.where(conflict_mask & (~share_region), torch.ones_like(conflict_region_id), conflict_region_id)
 
         # Feasible actions proxy using map polyline types and nearby lane offsets.
         M_actions = 6  # keep, LCL, LCR, TL, TR, stop (matches labels.NUM_MANEUVERS)

@@ -268,6 +268,7 @@ class FrenetMarginalEmission(nn.Module):
         x_dim: int,
         tau_dim: int,
         ctx_dim: int,
+        z_dim: int = 0,
         num_maneuvers: int,
         hidden_dim: int = 128,
         dt: float = 0.1,
@@ -280,12 +281,13 @@ class FrenetMarginalEmission(nn.Module):
         self.x_dim = int(x_dim)
         self.tau_dim = int(tau_dim)
         self.ctx_dim = int(ctx_dim)
+        self.z_dim = int(z_dim)
         self.num_maneuvers = int(num_maneuvers)
         self.dt = float(dt)
         self.min_logstd = float(min_logstd)
         self.max_logstd = float(max_logstd)
 
-        in_dim = self.tau_dim + self.ctx_dim
+        in_dim = self.tau_dim + self.ctx_dim + (self.z_dim if self.z_dim > 0 else 0)
         self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -344,13 +346,22 @@ class FrenetMarginalEmission(nn.Module):
         var = torch.exp(2.0 * logstd)
         return -0.5 * (((x - mean) ** 2) / (var + 1e-8) + 2.0 * logstd + math.log(2.0 * math.pi)).sum(dim=-1)
 
-    def log_prob(self, *, x: torch.Tensor, tau: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+    def log_prob(
+        self,
+        *,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        ctx: torch.Tensor,
+        z_mod: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Return log p(x | m, τ, ctx) for each maneuver.
 
         Args:
           x:   [B,N,T,3] action tokens (dx,dy,dyaw) in ego frame
           tau: [B,N,T,Dt]
           ctx: [B,N,T,Dc] where ctx[...,2]=yaw, ctx[...,3:5]=vx,vy
+          z_mod: [B,N,T,Dz] (optional). If provided and z_dim>0, we condition primitive
+            parameters on preferences as in the paper p(xi | m, z, tau).
         Returns:
           logp: [B,N,T,M]
         """
@@ -373,7 +384,15 @@ class FrenetMarginalEmission(nn.Module):
         b_ds = vs * dt
         b_dd = vd * dt
 
-        h = self.trunk(torch.cat([tau, ctx], dim=-1))
+        if self.z_dim > 0:
+            if z_mod is None:
+                raise ValueError("FrenetMarginalEmission requires z_mod when z_dim>0")
+            if z_mod.shape[:3] != tau.shape[:3] or z_mod.shape[-1] != self.z_dim:
+                raise ValueError(f"z_mod must have shape [B,N,T,{self.z_dim}], got {tuple(z_mod.shape)}")
+            h_in = torch.cat([tau, ctx, z_mod], dim=-1)
+        else:
+            h_in = torch.cat([tau, ctx], dim=-1)
+        h = self.trunk(h_in)
         dmu = self.to_dmu(h).view(B, N, T, self.num_maneuvers, 2)
         dlogvar = self.to_dlogvar(h).view(B, N, T, self.num_maneuvers, 2)
         dlogstd_noise = self.to_dlogstd_noise(h).view(B, N, T, self.num_maneuvers, 3)
@@ -435,6 +454,10 @@ class MotionPrimitiveDecoder(nn.Module):
         mod_hidden: int = 64,
         utility_hidden: int = 64,
         beta: float = 1.0,
+        # Feasible-action handling
+        feasible_action_penalty: float = 5.0,
+        feasible_action_soft_penalty_train: bool = True,
+        feasible_action_hard_mask_eval: bool = True,
         emission_type: str = "frenet",
         dt: float = 0.1,
     ) -> None:
@@ -444,6 +467,10 @@ class MotionPrimitiveDecoder(nn.Module):
         self.ctx_dim = int(ctx_dim)
         self.z_dim = int(z_dim)
         self.num_maneuvers = int(num_maneuvers)
+
+        self.feasible_action_penalty = float(feasible_action_penalty)
+        self.feasible_action_soft_penalty_train = bool(feasible_action_soft_penalty_train)
+        self.feasible_action_hard_mask_eval = bool(feasible_action_hard_mask_eval)
 
         self.modulation = LowRankTemplateModulation(z_dim=z_dim, tau_dim=tau_dim, rank=mod_rank, hidden_dim=mod_hidden)
         self.policy = RandomUtilityManeuverPolicy(
@@ -459,6 +486,7 @@ class MotionPrimitiveDecoder(nn.Module):
                 x_dim=x_dim,
                 tau_dim=tau_dim,
                 ctx_dim=ctx_dim,
+                z_dim=z_dim,
                 num_maneuvers=num_maneuvers,
                 hidden_dim=hidden_dim,
                 dt=float(dt),
@@ -510,10 +538,21 @@ class MotionPrimitiveDecoder(nn.Module):
             any_feas = fa.any(dim=-1, keepdim=True)
             fa = torch.where(any_feas, fa, torch.ones_like(fa))
 
-            logits = logits.masked_fill(~fa, float("-inf"))
+            if self.training and self.feasible_action_soft_penalty_train:
+                # Soft penalty during training to avoid brittle masking from imperfect map inference.
+                # Infeasible maneuvers are discouraged but not impossible.
+                penalty = float(self.feasible_action_penalty)
+                logits = logits - (~fa).to(dtype=logits.dtype) * penalty
+            else:
+                # Hard mask at evaluation / planning time.
+                if self.feasible_action_hard_mask_eval:
+                    logits = logits.masked_fill(~fa, float("-inf"))
+                else:
+                    penalty = float(self.feasible_action_penalty)
+                    logits = logits - (~fa).to(dtype=logits.dtype) * penalty
 
         if isinstance(self.emission, FrenetMarginalEmission):
-            logp = self.emission.log_prob(x=x, tau=tau, ctx=ctx)  # [B,N,T,M]
+            logp = self.emission.log_prob(x=x, tau=tau, ctx=ctx, z_mod=z_mod)  # [B,N,T,M]
         else:
             mean, logstd = self.emission(z_mod=z_mod, tau=tau, ctx=ctx)  # [B,N,T,M,Dx]
             x_e = x.unsqueeze(-2)  # [B,N,T,1,Dx]

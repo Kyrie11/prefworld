@@ -140,6 +140,13 @@ class PreferenceCompletion(nn.Module):
         hidden_dim: int = 128,
         prior_logvar: float = 0.0,
         num_maneuvers: int = 6,
+        # recommended stability improvements
+        context_dependent_prior: bool = True,
+        prior_hidden_dim: Optional[int] = None,
+        maneuver_beta: float = 1.0,
+        feasible_action_penalty: float = 5.0,
+        feasible_action_soft_penalty_train: bool = True,
+        feasible_action_hard_mask_eval: bool = True,
         # contrastive head
         con_proj_dim: int = 32,
         con_temperature: float = 0.2,
@@ -160,6 +167,10 @@ class PreferenceCompletion(nn.Module):
             z_dim=z_dim,
             num_maneuvers=self.num_maneuvers,
             hidden_dim=hidden_dim,
+            beta=float(maneuver_beta),
+            feasible_action_penalty=float(feasible_action_penalty),
+            feasible_action_soft_penalty_train=bool(feasible_action_soft_penalty_train),
+            feasible_action_hard_mask_eval=bool(feasible_action_hard_mask_eval),
         )
 
         # Projection head g for contrastive embeddings r=normalize(g(μ))
@@ -173,9 +184,54 @@ class PreferenceCompletion(nn.Module):
         self.register_buffer("prior_mean", torch.zeros(z_dim))
         self.register_buffer("prior_logvar", torch.full((z_dim,), float(prior_logvar)))
 
+        # Context-dependent prior p(z | c) (recommended; improves PC stability and expressiveness)
+        self.use_context_prior = bool(context_dependent_prior)
+        if prior_hidden_dim is None:
+            prior_hidden_dim = int(hidden_dim)
+        self._prior_hidden_dim = int(prior_hidden_dim)
+        if self.use_context_prior:
+            self.prior_net = nn.Sequential(
+                nn.Linear(int(tau_dim + ctx_dim), int(prior_hidden_dim)),
+                nn.ReLU(),
+                nn.Linear(int(prior_hidden_dim), 2 * int(z_dim)),
+            )
+            # initialize close to the fixed prior: mean≈0, logvar≈prior_logvar
+            last: nn.Linear = self.prior_net[-1]  # type: ignore[assignment]
+            nn.init.zeros_(last.weight)
+            with torch.no_grad():
+                last.bias[: int(z_dim)].zero_()
+                last.bias[int(z_dim) :].fill_(float(prior_logvar))
+        else:
+            self.prior_net = None
+
     def prior(self, batch_shape: Tuple[int, ...], device=None, dtype=None) -> DiagGaussian:
         mean = self.prior_mean.to(device=device, dtype=dtype).expand(*batch_shape, self.z_dim)
         logvar = self.prior_logvar.to(device=device, dtype=dtype).expand(*batch_shape, self.z_dim)
+        return DiagGaussian(mean=mean, logvar=logvar)
+
+    def prior_from_context(
+        self,
+        *,
+        tau: torch.Tensor,   # [B,N,T,Dt]
+        ctx: torch.Tensor,   # [B,N,T,Dc]
+        mask: torch.Tensor,  # [B,N,T] bool/float
+    ) -> DiagGaussian:
+        """Context-dependent prior p(z|c).
+
+        If context_dependent_prior is disabled, this returns the fixed N(0,I) prior.
+        """
+        B, N, T, _ = tau.shape
+        if not self.use_context_prior or self.prior_net is None:
+            return self.prior((B, N), device=tau.device, dtype=tau.dtype)
+
+        m = (mask > 0.5).to(dtype=tau.dtype)
+        denom = m.sum(dim=2, keepdim=True).clamp_min(1.0)
+        tau_mean = (tau * m.unsqueeze(-1)).sum(dim=2) / denom
+        ctx_mean = (ctx * m.unsqueeze(-1)).sum(dim=2) / denom
+        h = torch.cat([tau_mean, ctx_mean], dim=-1)
+        out = self.prior_net(h)
+        mean = out[..., : self.z_dim]
+        logvar = out[..., self.z_dim :].clamp(min=-10.0, max=10.0)
         return DiagGaussian(mean=mean, logvar=logvar)
 
     def _posterior_from_mask(
@@ -185,12 +241,14 @@ class PreferenceCompletion(nn.Module):
         delta_L: torch.Tensor,       # [B,N,T,Dz]
         alpha: torch.Tensor,         # [B,N,T]
         mask: torch.Tensor,          # [B,N,T]
+        prior: Optional[DiagGaussian] = None,
     ) -> PreferencePosterior:
         B, N, T, Dz = delta_eta.shape
         m = mask > 0.5
         a = alpha.unsqueeze(-1)
 
-        prior = self.prior((B, N), device=delta_eta.device, dtype=delta_eta.dtype)
+        if prior is None:
+            prior = self.prior((B, N), device=delta_eta.device, dtype=delta_eta.dtype)
         nat0 = NaturalDiagGaussian.from_moment(prior)
 
         pooled_eta = nat0.eta + (a * delta_eta * m.unsqueeze(-1).to(dtype=delta_eta.dtype)).sum(dim=2)
@@ -352,12 +410,15 @@ class PreferenceCompletion(nn.Module):
         # evidence -> natural increments
         delta_eta, delta_L, alpha = self.evidence(x, tau, ctx, valid_mask)
 
+        # Context-dependent prior p(z|c) (if enabled). We compute it from *context tokens* only.
+        prior_ctx = self.prior_from_context(tau=tau, ctx=ctx, mask=(ctx_mask > 0.5) & valid_mask)
+
         # teacher on full evidence (C∪Q)
         full_mask = (ctx_mask + query_mask) > 0.5
         full_mask = full_mask & valid_mask
 
-        post_full = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=full_mask)
-        post_ctx = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=ctx_mask)
+        post_full = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=full_mask, prior=prior_ctx)
+        post_ctx = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=ctx_mask, prior=prior_ctx)
 
         # agent validity (at least one token)
         agent_valid = (valid_mask.sum(dim=-1) > 0).to(dtype=torch.float32)  # [B,N]
@@ -411,8 +472,7 @@ class PreferenceCompletion(nn.Module):
         loss_distill_cov = self._kl_zero_mean_diag(post_full.q.logvar.detach(), post_ctx.q.logvar)  # [B,N]
 
         # ---- Prior KL ----
-        prior = self.prior((B, N), device=x.device, dtype=x.dtype)
-        loss_kl_ctx_prior = post_ctx.q.kl_to(prior)  # [B,N]
+        loss_kl_ctx_prior = post_ctx.q.kl_to(prior_ctx)  # [B,N]
 
         if free_bits > 0.0:
             # clamp KL terms only
@@ -426,8 +486,10 @@ class PreferenceCompletion(nn.Module):
         rnd2 = (torch.rand((B, N, T), device=x.device) < 0.5) & full_mask
         view1 = self._ensure_nonempty(full_mask.to(dtype=torch.float32), rnd1.to(dtype=torch.float32)) > 0.5
         view2 = self._ensure_nonempty(full_mask.to(dtype=torch.float32), rnd2.to(dtype=torch.float32)) > 0.5
-        post_v1 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view1)
-        post_v2 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view2)
+        prior_v1 = self.prior_from_context(tau=tau, ctx=ctx, mask=view1 & valid_mask)
+        prior_v2 = self.prior_from_context(tau=tau, ctx=ctx, mask=view2 & valid_mask)
+        post_v1 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view1, prior=prior_v1)
+        post_v2 = self._posterior_from_mask(delta_eta=delta_eta, delta_L=delta_L, alpha=alpha, mask=view2, prior=prior_v2)
         loss_contrastive = self._contrastive_loss(post_v1.q.mean, post_v2.q.mean, agent_valid)
 
         # ---- Overlap penalty R_Λ ----

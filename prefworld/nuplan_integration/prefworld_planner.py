@@ -23,11 +23,23 @@ from prefworld.models.prefworld_model import PrefWorldModel
 from prefworld.planning.planner import PlannerConfig, plan_with_structures
 
 
+# Defensive nuPlan imports (module must remain import-safe without nuPlan installed)
+try:  # pragma: no cover
+    from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner  # type: ignore
+    from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization, PlannerInput  # type: ignore
+except Exception:  # pragma: no cover
+    AbstractPlanner = object  # type: ignore
+    PlannerInitialization = Any  # type: ignore
+    PlannerInput = Any  # type: ignore
+
+
 @dataclass
 class NuPlanAdapterConfig:
     """Configuration for converting nuPlan inputs into PrefWorld batches."""
 
     max_agents: int = 20
+    agent_radius_m: float = 50.0
+    keep_only_vehicles: bool = True
     past_horizon_s: float = 2.0
     past_num_samples: int = 20
     future_horizon_s: float = 8.0
@@ -35,9 +47,16 @@ class NuPlanAdapterConfig:
     # Map sampling
     max_map_polylines: int = 200
     points_per_polyline: int = 20
+    map_radius_m: float = 60.0
+    include_route: bool = True
+    # If True, raise when feature extraction fails (prevents silent fallbacks to all-zeros).
+    strict_features: bool = True
+    # Structure extraction (rule-based, no future leakage)
+    structure_conflict_dist_m: float = 3.0
+    structure_conflict_radius_m: float = 2.0
 
 
-class PrefWorldNuPlanPlanner:
+class PrefWorldNuPlanPlanner(AbstractPlanner):
     """A nuPlan-compatible planner that wraps a trained PrefWorldModel.
 
     The planner:
@@ -144,131 +163,237 @@ class PrefWorldNuPlanPlanner:
 
         cfg = self.adapter_cfg
 
+        # Import PrefWorld extractor helpers lazily (keeps module import-safe).
+        from prefworld.data.extractor import ExtractionConfig, _agent_pose_vel_size, _get_track_token, _traffic_light_dict, _extract_map_polylines, _compute_structure_and_confidence_from_futures
+        from prefworld.utils.geometry import global_to_local_pose, global_to_local_xy
+
         # ------------------------------------------------------------------
-        # Ego past (t,x,y,yaw,vx,vy,ax,ay,steering)
+        # Ego history
         # ------------------------------------------------------------------
-        ego_hist = []
         try:
             ego_states = list(current_input.history.ego_states)  # type: ignore
         except Exception as e:
             raise RuntimeError("Unable to access ego history from nuPlan PlannerInput") from e
+        if len(ego_states) == 0:
+            raise RuntimeError("nuPlan PlannerInput contains empty ego history")
 
-        # Use last cfg.past_num_samples states.
-        ego_states = ego_states[-cfg.past_num_samples :]
-        t0 = ego_states[-1].time_point.time_s  # type: ignore
-        for st in ego_states:
-            # nuPlan EgoState has: rear_axle pose, velocities, accelerations
-            pose = st.rear_axle  # type: ignore
-            vx = float(getattr(st.dynamic_car_state.rear_axle_velocity_2d, "x", 0.0))
-            vy = float(getattr(st.dynamic_car_state.rear_axle_velocity_2d, "y", 0.0))
-            ax = float(getattr(st.dynamic_car_state.rear_axle_acceleration_2d, "x", 0.0))
-            ay = float(getattr(st.dynamic_car_state.rear_axle_acceleration_2d, "y", 0.0))
-            steering = float(getattr(st.tire_steering_angle, "value", 0.0))
-            ego_hist.append(
-                [
-                    float(st.time_point.time_s - t0),
-                    float(pose.x),
-                    float(pose.y),
-                    float(pose.heading),
-                    vx,
-                    vy,
-                    ax,
-                    ay,
-                    steering,
-                ]
-            )
-        ego_hist = np.asarray(ego_hist, dtype=np.float32)
+        Tp = int(cfg.past_num_samples)
+        if len(ego_states) < Tp:
+            ego_states = [ego_states[0]] * (Tp - len(ego_states)) + ego_states
+        ego_states = ego_states[-Tp:]
+
+        # current ego pose (global)
+        ego_v = EgoStateVector.from_ego_state(ego_states[-1])
+        ego_xy = np.array([float(ego_v.x), float(ego_v.y)], dtype=np.float32)
+        ego_yaw = float(ego_v.yaw)
 
         # ------------------------------------------------------------------
-        # Agents current state (x,y,yaw,vx,vy,length,width) in ego-local frame
+        # Observations (tracked objects) history
         # ------------------------------------------------------------------
-        # This is a minimal adapter: use the current tracked objects only.
-        try:
-            tracks = current_input.history.current_state.tracked_objects  # type: ignore
-        except Exception as e:
-            raise RuntimeError("Unable to access tracked objects from nuPlan PlannerInput") from e
+        hist = current_input.history
+        obs_list = None
+        for attr in ("observations", "observation_buffer", "observations_buffer"):
+            if hasattr(hist, attr):
+                try:
+                    obs_list = list(getattr(hist, attr))
+                    break
+                except Exception:
+                    obs_list = None
 
-        # Ego-local transform
-        ego_x, ego_y, ego_yaw = ego_hist[-1, 1], ego_hist[-1, 2], ego_hist[-1, 3]
-        cy, sy = np.cos(-ego_yaw), np.sin(-ego_yaw)
-
-        def to_local_xy(x: float, y: float) -> tuple[float, float]:
-            dx, dy = x - ego_x, y - ego_y
-            return (cy * dx - sy * dy, sy * dx + cy * dy)
-
-        def to_local_vel(vx: float, vy: float) -> tuple[float, float]:
-            return (cy * vx - sy * vy, sy * vx + cy * vy)
-
-        agents = np.zeros((cfg.max_agents, 7), dtype=np.float32)
-        agents_mask = np.zeros((cfg.max_agents,), dtype=np.float32)
-        # Iterate over tracked objects and keep vehicles only.
-        count = 0
-        for obj in getattr(tracks, "tracked_objects", tracks):  # handles both container styles
-            if count >= cfg.max_agents:
-                break
+        if obs_list is None:
+            # Fallback: replicate the current tracked objects snapshot.
             try:
-                # Vehicle-like objects expose oriented_box and velocity
-                box = obj.box  # type: ignore
-                xg, yg = float(box.center.x), float(box.center.y)
-                yawg = float(box.center.heading)
-                vxg = float(getattr(obj.velocity, "x", 0.0))
-                vyg = float(getattr(obj.velocity, "y", 0.0))
-                length = float(getattr(box, "length", 4.5))
-                width = float(getattr(box, "width", 2.0))
+                obs_list = [hist.current_state] * Tp
+            except Exception:
+                obs_list = [getattr(hist, "current_state", None)] * Tp
+
+        if len(obs_list) < Tp:
+            obs_list = [obs_list[0]] * (Tp - len(obs_list)) + obs_list
+        obs_list = obs_list[-Tp:]
+
+        def _iter_objects(obs: Any):
+            if obs is None:
+                return []
+            # typical: Observation has .tracked_objects
+            cont = getattr(obs, "tracked_objects", obs)
+            objs = getattr(cont, "tracked_objects", None)
+            if objs is not None:
+                try:
+                    return list(objs)
+                except Exception:
+                    return []
+            try:
+                return list(cont)
+            except Exception:
+                return []
+
+        # ------------------------------------------------------------------
+        # Select agents from the current snapshot
+        # ------------------------------------------------------------------
+        curr_objs = _iter_objects(obs_list[-1])
+        cand = []
+        for o in curr_objs:
+            if bool(cfg.keep_only_vehicles):
+                t = getattr(o, "tracked_object_type", None)
+                if t is None:
+                    t = getattr(o, "object_type", None)
+                if t is not None and ("vehicle" not in str(t).lower()):
+                    continue
+            try:
+                token = _get_track_token(o)
+                pose, vel, length, width = _agent_pose_vel_size(o)
             except Exception:
                 continue
-
-            xl, yl = to_local_xy(xg, yg)
-            vxl, vyl = to_local_vel(vxg, vyg)
-            yawl = float(np.arctan2(np.sin(yawg - ego_yaw), np.cos(yawg - ego_yaw)))
-
-            agents[count] = np.array([xl, yl, yawl, vxl, vyl, length, width], dtype=np.float32)
-            agents_mask[count] = 1.0
-            count += 1
-
-        # ------------------------------------------------------------------
-        # Map polylines
-        # ------------------------------------------------------------------
-        # NOTE: Map extraction depends heavily on nuPlan map API. We provide a safe fallback:
-        map_polylines = np.zeros((cfg.max_map_polylines, cfg.points_per_polyline, 2), dtype=np.float32)
-        map_mask = np.zeros((cfg.max_map_polylines,), dtype=np.float32)
-        map_type = np.zeros((cfg.max_map_polylines,), dtype=np.int64)
+            pose_local = global_to_local_pose(pose[None, :], ego_xy, ego_yaw)[0]
+            d = float(np.linalg.norm(pose_local[:2]))
+            if d > float(cfg.agent_radius_m):
+                continue
+            cand.append((d, token))
+        cand.sort(key=lambda x: x[0])
+        track_tokens = [t for _, t in cand[: int(cfg.max_agents)]]
 
         # ------------------------------------------------------------------
-        # Build tensors
+        # Build agents history arrays in ego-local frame of current ego
         # ------------------------------------------------------------------
-        # PrefWorld expects shapes:
-        #  ego_hist:      [B,Tp,3]   (x,y,yaw) in ego-local frame
-        #  ego_dyn_hist:  [B,Tp,4]   (vx,vy,ax,ay) in ego-local frame
-        #  agents_hist:   [B,N,Tp,7]
-        #  agents_hist_mask: [B,N,Tp]
-        #  map_polylines: [B,M,L,2]
-        #  map_poly_mask: [B,M]
-        #  structure_t_rule: [B,1+N,1+N]
-        #
-        # For online planning, we may only have the current snapshot; replicate across Tp.
-        Tp = int(ego_hist.shape[0])
-        agents_hist = np.tile(agents[:, None, :], (1, Tp, 1))  # [N,Tp,7]
-        agents_hist_mask = np.tile(agents_mask[:, None], (1, Tp))
+        N = int(cfg.max_agents)
+        agents_hist = np.zeros((N, Tp, 7), dtype=np.float32)
+        agents_hist_mask = np.zeros((N, Tp), dtype=np.float32)
 
-        # Ego history in ego-local frame (current ego pose is origin)
+        for k in range(Tp):
+            objs_k = _iter_objects(obs_list[k])
+            token_to_obj = {}
+            for o in objs_k:
+                try:
+                    token_to_obj[_get_track_token(o)] = o
+                except Exception:
+                    continue
+
+            for i, token in enumerate(track_tokens):
+                if i >= N:
+                    break
+                o = token_to_obj.get(token, None)
+                if o is None:
+                    continue
+                try:
+                    pose, vel, length, width = _agent_pose_vel_size(o)
+                except Exception:
+                    continue
+                pose_local = global_to_local_pose(pose[None, :], ego_xy, ego_yaw)[0]
+                vel_local = global_to_local_xy(vel[None, :], np.zeros(2, dtype=np.float32), ego_yaw)[0]
+                agents_hist[i, k] = np.array([pose_local[0], pose_local[1], pose_local[2], vel_local[0], vel_local[1], length, width], dtype=np.float32)
+                agents_hist_mask[i, k] = 1.0
+
+        # ------------------------------------------------------------------
+        # Ego history in ego-local frame (current ego is origin)
+        # ------------------------------------------------------------------
         ego_hist_local = np.zeros((Tp, 3), dtype=np.float32)
         ego_dyn_local = np.zeros((Tp, 4), dtype=np.float32)
-        for k in range(Tp):
-            xg, yg, yawg = float(ego_hist[k, 1]), float(ego_hist[k, 2]), float(ego_hist[k, 3])
-            vxg, vyg = float(ego_hist[k, 4]), float(ego_hist[k, 5])
-            axg, ayg = float(ego_hist[k, 6]), float(ego_hist[k, 7])
+        for k, st in enumerate(ego_states):
+            ev = EgoStateVector.from_ego_state(st)
+            pose_g = np.array([float(ev.x), float(ev.y), float(ev.yaw)], dtype=np.float32)
+            ego_hist_local[k] = global_to_local_pose(pose_g[None, :], ego_xy, ego_yaw)[0]
 
-            xl, yl = to_local_xy(xg, yg)
-            vxl, vyl = to_local_vel(vxg, vyg)
-            axl, ayl = to_local_vel(axg, ayg)
-            yawl = float(np.arctan2(np.sin(yawg - ego_yaw), np.cos(yawg - ego_yaw)))
+            vxg, vyg = float(ev.vx), float(ev.vy)
+            axg, ayg = float(ev.ax), float(ev.ay)
+            vel_local = global_to_local_xy(np.array([[vxg, vyg]], dtype=np.float32), np.zeros(2, dtype=np.float32), ego_yaw)[0]
+            acc_local = global_to_local_xy(np.array([[axg, ayg]], dtype=np.float32), np.zeros(2, dtype=np.float32), ego_yaw)[0]
+            ego_dyn_local[k] = np.array([vel_local[0], vel_local[1], acc_local[0], acc_local[1]], dtype=np.float32)
 
-            ego_hist_local[k] = np.array([xl, yl, yawl], dtype=np.float32)
-            ego_dyn_local[k] = np.array([vxl, vyl, axl, ayl], dtype=np.float32)
+        # ------------------------------------------------------------------
+        # Map extraction (match offline extractor as closely as possible)
+        # ------------------------------------------------------------------
+        ex_cfg = ExtractionConfig(
+            past_horizon_s=float(cfg.past_horizon_s),
+            past_num_samples=int(cfg.past_num_samples),
+            future_horizon_s=float(cfg.future_horizon_s),
+            future_num_samples=int(cfg.future_num_samples),
+            max_agents=int(cfg.max_agents),
+            agent_radius_m=float(cfg.agent_radius_m),
+            keep_only_vehicles=bool(cfg.keep_only_vehicles),
+            map_radius_m=float(cfg.map_radius_m),
+            max_map_polylines=int(cfg.max_map_polylines),
+            polyline_points=int(cfg.points_per_polyline),
+            include_route=bool(cfg.include_route),
+            structure_conflict_dist_m=float(cfg.structure_conflict_dist_m),
+            structure_conflict_radius_m=float(cfg.structure_conflict_radius_m),
+        )
 
+        map_polylines = np.zeros((int(cfg.max_map_polylines), int(cfg.points_per_polyline), 2), dtype=np.float32)
+        map_mask = np.zeros((int(cfg.max_map_polylines),), dtype=np.float32)
+        map_type = np.zeros((int(cfg.max_map_polylines),), dtype=np.int64)
+        map_tl = np.zeros((int(cfg.max_map_polylines),), dtype=np.int64)
+        map_on_route = np.zeros((int(cfg.max_map_polylines),), dtype=np.int64)
+
+        try:
+            map_api = getattr(self._initialization, "map_api", None)
+            route_ids = getattr(self._initialization, "route_roadblock_ids", []) or []
+
+            # traffic lights
+            tl_statuses = None
+            for name in (
+                "traffic_light_data",
+                "traffic_light_status_data",
+                "traffic_light_statuses",
+                "traffic_light_status",
+            ):
+                if hasattr(current_input, name):
+                    tl_statuses = getattr(current_input, name)
+                    break
+                if hasattr(hist, "current_state") and hasattr(hist.current_state, name):
+                    tl_statuses = getattr(hist.current_state, name)
+                    break
+            tl_dict = _traffic_light_dict(tl_statuses) if tl_statuses is not None else {}
+
+            if map_api is not None:
+                mf = _extract_map_polylines(
+                    map_api=map_api,
+                    ego_xy=ego_xy,
+                    ego_yaw=float(ego_yaw),
+                    route_roadblock_ids=list(route_ids),
+                    tl_dict=tl_dict,
+                    cfg=ex_cfg,
+                )
+                map_polylines = mf["map_polylines"].astype(np.float32)
+                map_mask = mf["map_poly_mask"].astype(np.float32)
+                map_type = mf["map_poly_type"].astype(np.int64)
+                map_tl = mf.get("map_tl_status", np.zeros_like(map_type)).astype(np.int64)
+                map_on_route = mf.get("map_on_route", np.zeros_like(map_type)).astype(np.int64)
+            else:
+                if bool(getattr(cfg, "strict_features", True)):
+                    raise RuntimeError("nuPlan map_api not available (strict_features=True)")
+        except Exception as e:
+            if bool(getattr(cfg, "strict_features", True)):
+                raise RuntimeError(f"nuPlan map extraction failed (strict_features=True): {e}")
+            # Non-strict fallback: keep safe zero map
+            pass
+
+        # ------------------------------------------------------------------
+        # Rule-based structure at current time (no future leakage)
+        # ------------------------------------------------------------------
         K = 1 + int(cfg.max_agents)
-        structure_t = np.zeros((1, K, K), dtype=np.float32)
+        dt_fut = float(cfg.future_horizon_s) / max(1, int(cfg.future_num_samples))
+        horizon_rule = min(3.0, float(cfg.future_horizon_s))
+        T_rule = int(round(horizon_rule / dt_fut)) + 1
+
+        traj_xy_rule = np.zeros((K, T_rule, 2), dtype=np.float32)
+        vel_rule = np.zeros((K, 2), dtype=np.float32)
+        traj_xy_rule[0, 0] = np.array([0.0, 0.0], dtype=np.float32)
+        # ego velocity in ego frame
+        ego_vel_local = ego_dyn_local[-1, :2]
+        vel_rule[0] = ego_vel_local
+        # agents
+        for i in range(int(cfg.max_agents)):
+            if agents_hist_mask[i, -1] < 0.5:
+                continue
+            traj_xy_rule[1 + i, 0] = agents_hist[i, -1, :2]
+            vel_rule[1 + i] = agents_hist[i, -1, 3:5]
+        for t in range(1, T_rule):
+            tt = float(t) * dt_fut
+            traj_xy_rule[:, t] = traj_xy_rule[:, 0] + vel_rule * tt
+        valid = np.zeros((K,), dtype=np.float32)
+        valid[0] = 1.0
+        valid[1:] = agents_hist_mask[:, -1]
+        structure_t_rule, structure_conf_t = _compute_structure_and_confidence_from_futures(traj_xy_rule, valid, ex_cfg)
 
         batch_np: Dict[str, Any] = {
             "ego_hist": ego_hist_local[None, :, :],
@@ -278,13 +403,14 @@ class PrefWorldNuPlanPlanner:
             "map_polylines": map_polylines[None, :, :, :],
             "map_poly_mask": map_mask[None, :],
             "map_poly_type": map_type[None, :],
-            # Required by model.forward (planning uses candidate ego maneuvers)
+            "map_tl_status": map_tl[None, :],
+            "map_on_route": map_on_route[None, :],
+            # planning-time placeholder (not used for inference)
             "ego_maneuver": np.zeros((1, 1), dtype=np.int64),
-            # Safe default: assume no interaction edges at current time.
-            "structure_t_rule": structure_t,
-            # For converting local planned trajectory back to global nuPlan frame.
-            "ego_global_pose": np.array([[ego_x, ego_y, ego_yaw]], dtype=np.float32),
+            "structure_t_rule": structure_t_rule[None, :, :],
+            "structure_conf_t": np.array([float(structure_conf_t)], dtype=np.float32),
+            # local->global conversion
+            "ego_global_pose": np.array([[float(ego_xy[0]), float(ego_xy[1]), float(ego_yaw)]], dtype=np.float32),
         }
 
-        batch_t = {k: torch.as_tensor(v, device=self.device) for k, v in batch_np.items()}
-        return batch_t
+        return {k: torch.as_tensor(v, device=self.device) for k, v in batch_np.items()}

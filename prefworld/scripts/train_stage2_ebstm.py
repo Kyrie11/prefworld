@@ -110,6 +110,9 @@ def main() -> None:
                 eb_cf_weight=float(tcfg.get("eb_cf_weight", 0.0)),
                 eb_cf_base_temperature=float(tcfg.get("eb_cf_base_temperature", 2.0)),
                 eb_cf_actions=tuple(tcfg.get("eb_cf_actions", (0, 1, 2))),
+                eb_pref_sens_weight=float(tcfg.get("eb_pref_sens_weight", 0.0)),
+                eb_pref_sens_margin=float(tcfg.get("eb_pref_sens_margin", 0.2)),
+                eb_base_l2_weight=float(tcfg.get("eb_base_l2_weight", 0.0)),
             )
 
             eb_loss_key = "loss_eb_total" if "loss_eb_total" in out.losses else "loss_eb"

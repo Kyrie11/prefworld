@@ -34,6 +34,13 @@ train:
   # EB transition loss
   w_eb: 1.0
 
+  # --- New: regularize EB-STM to actually use preference beliefs ---
+  # Encourage the oracle transition to become less likely when we shuffle non-ego z (prevents phi≈0).
+  eb_pref_sens_weight: 0.0
+  eb_pref_sens_margin: 0.2
+  # Discourage over-reliance on template-only base energies. Small values like 1e-4 are typical.
+  eb_base_l2_weight: 0.0
+
   # Optional smoothness and physical plausibility penalties in EB-STM
   eb_smooth_scale: 0.1
   eb_phys_dist_threshold_m: 50.0

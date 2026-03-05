@@ -342,6 +342,75 @@ def _compute_structure_from_futures(
     return A
 
 
+def _compute_structure_and_confidence_from_futures(
+    traj_xy: np.ndarray,  # [K, T, 2] in ego frame, includes ego at index 0
+    valid_mask: np.ndarray,  # [K]
+    cfg: ExtractionConfig,
+) -> Tuple[np.ndarray, np.float32]:
+    """Compute structure adjacency and a lightweight confidence score w∈[0,1].
+
+    This is a *practical* approximation of the paper's extractor confidence w_t.
+    We measure how "decisive" each predicted precedence relation is:
+      - closer encounters (smaller d_min) are more confident
+      - larger time separation |t_i - t_j| at the conflict region is more confident
+
+    The returned confidence is averaged over predicted edges. If no edges are
+    predicted (no conflicts), we return w=1.0.
+    """
+    K, T, _ = traj_xy.shape
+    A = np.zeros((K, K), dtype=np.int64)
+    score = np.zeros((K, K), dtype=np.float32)  # used for cycle breaking
+    edge_conf: List[float] = []
+
+    for i in range(K):
+        if not valid_mask[i]:
+            continue
+        for j in range(i + 1, K):
+            if not valid_mask[j]:
+                continue
+
+            d = np.linalg.norm(traj_xy[i] - traj_xy[j], axis=-1)  # [T]
+            t_min = int(np.argmin(d))
+            d_min = float(d[t_min])
+            if d_min > cfg.structure_conflict_dist_m:
+                continue
+
+            p_conf = 0.5 * (traj_xy[i, t_min] + traj_xy[j, t_min])
+            r = float(cfg.structure_conflict_radius_m)
+            di = np.linalg.norm(traj_xy[i] - p_conf[None, :], axis=-1)
+            dj = np.linalg.norm(traj_xy[j] - p_conf[None, :], axis=-1)
+            idx_i = np.where(di < r)[0]
+            idx_j = np.where(dj < r)[0]
+            if len(idx_i) == 0 or len(idx_j) == 0:
+                continue
+            ti = int(idx_i[0])
+            tj = int(idx_j[0])
+
+            # confidence proxy
+            d_conf = max(0.0, min(1.0, (float(cfg.structure_conflict_dist_m) - d_min) / max(1e-6, float(cfg.structure_conflict_dist_m))))
+            t_conf = max(0.0, min(1.0, float(abs(ti - tj)) / max(1.0, float(T - 1))))
+            conf = 0.5 * d_conf + 0.5 * t_conf
+
+            if ti < tj:
+                A[j, i] = 1
+                score[j, i] = float(abs(tj - ti))
+                edge_conf.append(conf)
+            elif tj < ti:
+                A[i, j] = 1
+                score[i, j] = float(abs(ti - tj))
+                edge_conf.append(conf)
+            else:
+                # tie: ignore
+                pass
+
+    A = _enforce_acyclic(A, valid_mask=valid_mask, edge_score=score)
+    if len(edge_conf) == 0:
+        w = 1.0
+    else:
+        w = float(np.clip(np.mean(np.array(edge_conf, dtype=np.float32)), 0.0, 1.0))
+    return A, np.float32(w)
+
+
 def _find_cycle_edges(A: np.ndarray, valid_mask: np.ndarray) -> Optional[list[tuple[int, int]]]:
     """Return a list of directed edges (u,v) that form a cycle, or None if acyclic."""
     K = A.shape[0]
@@ -590,7 +659,7 @@ def extract_sample(
     for t in range(1, T_rule):
         tt = float(t) * dt_fut
         traj_xy_rule[:, t] = traj_xy_rule[:, 0] + vel_rule * tt
-    structure_t_rule = _compute_structure_from_futures(traj_xy_rule, valid, cfg)
+    structure_t_rule, structure_conf_t = _compute_structure_and_confidence_from_futures(traj_xy_rule, valid, cfg)
 
     # Structure at t + delta
     # nuPlan scenario interval (seconds)
@@ -660,6 +729,30 @@ def extract_sample(
 
     structure_t1 = _compute_structure_from_futures(traj_xy2, valid2, cfg)
 
+    # Rule-based structure at t+delta (NO future leakage): constant-velocity rollout in ego2 frame.
+    traj_xy2_rule = np.zeros((K, T_rule, 2), dtype=np.float32)
+    vel2_rule = np.zeros((K, 2), dtype=np.float32)
+    traj_xy2_rule[0, 0] = np.array([0.0, 0.0], dtype=np.float32)
+    ego_vel_local2 = global_to_local_xy(ego_vec2[4:6][None, :], np.zeros(2, dtype=np.float32), ego_yaw2)[0]
+    vel2_rule[0] = ego_vel_local2
+    for i, token in enumerate(track_tokens):
+        if i >= cfg.max_agents:
+            break
+        if valid2[1 + i] < 0.5:
+            continue
+        o = token_to_obj2.get(token, None)
+        if o is None:
+            continue
+        pose, vel, length, width = _agent_pose_vel_size(o)
+        pose_local = global_to_local_pose(pose[None, :], ego_xy2, ego_yaw2)[0]
+        vel_local = global_to_local_xy(vel[None, :], np.zeros(2, dtype=np.float32), ego_yaw2)[0]
+        traj_xy2_rule[1 + i, 0] = pose_local[:2]
+        vel2_rule[1 + i] = vel_local
+    for t in range(1, T_rule):
+        tt = float(t) * dt_fut
+        traj_xy2_rule[:, t] = traj_xy2_rule[:, 0] + vel2_rule * tt
+    structure_t1_rule, structure_conf_t1 = _compute_structure_and_confidence_from_futures(traj_xy2_rule, valid2, cfg)
+
     # Map features
     tl_statuses = scenario.get_traffic_light_status_at_iteration(iteration)
     tl_dict = _traffic_light_dict(tl_statuses)
@@ -693,6 +786,9 @@ def extract_sample(
         "structure_t": structure_t,  # [1+Nmax,1+Nmax]
         "structure_t1": structure_t1,
         "structure_t_rule": structure_t_rule,
+        "structure_t1_rule": structure_t1_rule,
+        "structure_conf_t": np.array([float(structure_conf_t)], dtype=np.float32),
+        "structure_conf_t1": np.array([float(structure_conf_t1)], dtype=np.float32),
         # Map
         "map_polylines": map_feat["map_polylines"].astype(np.float32),
         "map_poly_mask": map_feat["map_poly_mask"].astype(np.float32),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -51,10 +52,20 @@ class PrefWorldModel(nn.Module):
         z_dim: int = 8,
         tau_dim: int = 64,
         pc_hidden: int = 128,
+        # PC stability / expressiveness knobs
+        pc_context_dependent_prior: bool = True,
+        pc_prior_hidden: Optional[int] = None,
+        maneuver_beta: float = 1.0,
+        feasible_action_penalty: float = 5.0,
+        feasible_action_soft_penalty_train: bool = True,
+        feasible_action_hard_mask_eval: bool = True,
         template_hidden: int = 128,
         energy_hidden: int = 128,
         eb_temperature: float = 1.0,
         eb_max_candidates: int = 64,
+        # (Req-5) Candidate expansion: allow 2-step edit combinations in EB-STM
+        eb_two_step_topk_pairs: int = 0,
+        eb_two_step_beam_size: int = 24,
         num_maneuvers: int = NUM_MANEUVERS,
         # EFEN constants
         lambda_u: float = 1.0,
@@ -77,6 +88,12 @@ class PrefWorldModel(nn.Module):
             z_dim=self.z_dim,
             hidden_dim=int(pc_hidden),
             num_maneuvers=self.num_maneuvers,
+            context_dependent_prior=bool(pc_context_dependent_prior),
+            prior_hidden_dim=pc_prior_hidden,
+            maneuver_beta=float(maneuver_beta),
+            feasible_action_penalty=float(feasible_action_penalty),
+            feasible_action_soft_penalty_train=bool(feasible_action_soft_penalty_train),
+            feasible_action_hard_mask_eval=bool(feasible_action_hard_mask_eval),
         )
 
         # EFEN / EB-STM (paper-faithful edit-token transition energy)
@@ -87,7 +104,13 @@ class PrefWorldModel(nn.Module):
             lambda_u=float(lambda_u),
             return_token_params=bool(return_token_params),
         )
-        self.ebstm = EBSTM(self.energy_net, temperature=float(eb_temperature), max_candidates=int(eb_max_candidates))
+        self.ebstm = EBSTM(
+            self.energy_net,
+            temperature=float(eb_temperature),
+            max_candidates=int(eb_max_candidates),
+            two_step_topk_pairs=int(eb_two_step_topk_pairs),
+            two_step_beam_size=int(eb_two_step_beam_size),
+        )
 
         # constants for ego vehicle size (approx)
         self.ego_length = 4.8
@@ -100,10 +123,18 @@ class PrefWorldModel(nn.Module):
             "z_dim": int(z_dim),
             "tau_dim": int(tau_dim),
             "pc_hidden": int(pc_hidden),
+            "pc_context_dependent_prior": bool(pc_context_dependent_prior),
+            "pc_prior_hidden": None if pc_prior_hidden is None else int(pc_prior_hidden),
+            "maneuver_beta": float(maneuver_beta),
+            "feasible_action_penalty": float(feasible_action_penalty),
+            "feasible_action_soft_penalty_train": bool(feasible_action_soft_penalty_train),
+            "feasible_action_hard_mask_eval": bool(feasible_action_hard_mask_eval),
             "template_hidden": int(template_hidden),
             "energy_hidden": int(energy_hidden),
             "eb_temperature": float(eb_temperature),
             "eb_max_candidates": int(eb_max_candidates),
+            "eb_two_step_topk_pairs": int(eb_two_step_topk_pairs),
+            "eb_two_step_beam_size": int(eb_two_step_beam_size),
             "num_maneuvers": int(num_maneuvers),
             "lambda_u": float(lambda_u),
             "return_token_params": bool(return_token_params),
@@ -201,6 +232,35 @@ class PrefWorldModel(nn.Module):
         # action part for non-ego agents is zero
         return feat, mask
 
+    @staticmethod
+    def _shuffle_non_ego_beliefs(
+        z_mean: torch.Tensor,
+        z_logvar: torch.Tensor,
+        agent_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shuffle non-ego preference beliefs within each batch item.
+
+        This is used to regularize EB-STM so that it cannot ignore preference inputs.
+        Ego (index 0) is never shuffled. Invalid agents (mask=0) are kept as-is.
+
+        Returns:
+          z_mean_shuf, z_logvar_shuf, shuffle_mask [B] (True if shuffled)
+        """
+        B, K, Dz = z_mean.shape
+        z_m = z_mean.clone()
+        z_v = z_logvar.clone()
+        did = torch.zeros((B,), device=z_mean.device, dtype=torch.bool)
+        for b in range(B):
+            valid = (agent_mask[b, 1:] > 0.5).nonzero(as_tuple=False).view(-1)
+            if valid.numel() < 2:
+                continue
+            idx = valid + 1  # shift to account for ego
+            perm = idx[torch.randperm(idx.numel(), device=z_mean.device)]
+            z_m[b, idx] = z_mean[b, perm]
+            z_v[b, idx] = z_logvar[b, perm]
+            did[b] = True
+        return z_m, z_v, did
+
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
@@ -227,13 +287,25 @@ class PrefWorldModel(nn.Module):
         eb_smooth_scale: float = 0.0,
         eb_phys_dist_threshold_m: float = 1e9,
         eb_phys_penalty_scale: float = 0.0,
+        # EB noisy-observation supervision (paper Sec.6 / App.)
+        eb_use_noisy_obs: bool = True,
+        eb_noisy_epsilon0: float = 0.2,
+        eb_noisy_w_min: float = 0.2,
+        eb_noisy_eps_min: float = 1e-4,
         # EB counterfactual conservatism regularizer (paper Eq.(26))
         eb_cf_weight: float = 0.0,
         eb_cf_base_temperature: float = 2.0,
         eb_cf_actions: Optional[Tuple[int, ...]] = None,
+        # EB regularizers to prevent the energy model from ignoring preferences
+        eb_pref_sens_weight: float = 0.0,
+        eb_pref_sens_margin: float = 0.2,
+        eb_base_l2_weight: float = 0.0,
         # Optional weak supervision for maneuver metrics
         use_pseudo_intent: bool = False,
         intent_weight: float = 1.0,
+        # Guardrail: maneuver labels come from future trajectories and leak information.
+        # Only enable if you *explicitly* want leaky supervision/metrics.
+        allow_future_label_leakage: bool = False,
     ) -> ModelOutput:
         # Unpack
         agents_hist = batch["agents_hist"]            # [B,N,Tp,7]
@@ -323,6 +395,11 @@ class PrefWorldModel(nn.Module):
 
         # Optional weak supervision for maneuver (ablations)
         if use_pseudo_intent and agents_m is not None:
+            if not bool(allow_future_label_leakage):
+                raise ValueError(
+                    "use_pseudo_intent=True uses maneuver labels computed from future trajectories (information leakage). "
+                    "If you intentionally want this ablation, pass allow_future_label_leakage=True."
+                )
             ce = F.cross_entropy(maneuver_logits_last.reshape(B * N, -1), agents_m.reshape(B * N), reduction="none").reshape(B, N)
             loss_intent = intent_weight * masked_mean(ce, agents_valid)
         else:
@@ -335,6 +412,16 @@ class PrefWorldModel(nn.Module):
             if A_t is None:
                 raise KeyError("structure_t_rule/structure_t missing in batch but run_eb=True")
 
+            # Noisy observation at t+1 (preferred, avoids future leakage).
+            # If not available, we fall back to the oracle structure_t1 (leaky; offline-only).
+            A_obs_t1 = batch.get("structure_t1_rule", None)
+            w_t = batch.get("structure_conf_t", None)
+            w_t1 = batch.get("structure_conf_t1", None)
+            if w_t is not None and torch.is_tensor(w_t):
+                w_t = w_t.view(-1).to(dtype=agents_hist.dtype)
+            if w_t1 is not None and torch.is_tensor(w_t1):
+                w_t1 = w_t1.view(-1).to(dtype=agents_hist.dtype)
+
             agents_curr = agents_hist[:, :, -1, :]  # [B,N,7]
             ego_dyn_curr = ego_dyn_hist[:, -1, :]   # [B,4]
             tau_curr = tau_all[:, :, -1, :]         # [B,1+N,Dt]
@@ -344,29 +431,125 @@ class PrefWorldModel(nn.Module):
             z_mean_eb = z_mean.detach() if detach_pc_for_eb else z_mean
             z_logvar_eb = z_logvar.detach() if detach_pc_for_eb else z_logvar
 
+            # Candidate energies and transition distribution.
+            # For noisy-observation training we must NOT force-insert the oracle.
             out_eb = self.ebstm(
                 A_t,
                 eb_feat,
                 z_mean_eb,
                 z_logvar_eb,
                 eb_mask,
-                oracle_next=A_t1,
+                oracle_next=None if bool(eb_use_noisy_obs) else A_t1,
                 smooth_scale=float(eb_smooth_scale),
                 phys_dist_threshold_m=float(eb_phys_dist_threshold_m),
                 phys_penalty_scale=float(eb_phys_penalty_scale),
             )
-            if A_t1 is not None:
+
+            # -------------------------------------------------
+            # EB supervision
+            #   - Preferred (paper-faithful): soft targets from noisy observation 
+            #     \tilde s_{t+1} (no future leakage).
+            #   - Fallback: hard oracle label structure_t1 (offline-only).
+            # -------------------------------------------------
+            loss_eb = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
+            if bool(eb_use_noisy_obs) and A_obs_t1 is not None:
+                # confidence weights
+                if w_t is None:
+                    w_t = torch.ones((B,), device=agents_hist.device, dtype=agents_hist.dtype)
+                if w_t1 is None:
+                    w_t1 = torch.ones((B,), device=agents_hist.device, dtype=agents_hist.dtype)
+                w_tt1 = torch.minimum(w_t, w_t1)
+
+                # Drop low-confidence transitions (paper: skip if w < w_min).
+                w_min = float(eb_noisy_w_min)
+                keep = (w_tt1 >= w_min).to(dtype=agents_hist.dtype)
+
+                # Observation noise rate eps_t = eps0 (1 - w_{t+1}).
+                eps0 = float(eb_noisy_epsilon0)
+                eps = eps0 * (1.0 - w_t1).clamp(min=0.0, max=1.0)
+                eps = eps.clamp(min=float(eb_noisy_eps_min), max=1.0 - float(eb_noisy_eps_min))  # [B]
+
+                # Build per-candidate soft targets q_{t+1}(\tau') \propto p_\eta(\tilde s | s(\tau')).
+                cand_A = out_eb.candidate_A  # [B,C,K,K]
+                cand_mask = out_eb.candidate_mask  # [B,C] bool
+
+                # 3-state relation type per unordered pair (upper triangle only).
+                cand_typ = self.ebstm._relation_state3(cand_A)  # [B,C,K,K]
+                obs_typ = self.ebstm._relation_state3(A_obs_t1.to(device=cand_A.device)).unsqueeze(1)  # [B,1,K,K]
+
+                # valid unordered pairs (i<j) among valid nodes
+                pair_mask = out_eb.pair_energies.pair_mask  # [B,K,K] bool
+                Kk = pair_mask.shape[-1]
+                triu = torch.triu(torch.ones((Kk, Kk), device=pair_mask.device, dtype=torch.bool), diagonal=1)
+                valid_pairs = (pair_mask & triu).unsqueeze(1)  # [B,1,K,K]
+
+                match = (cand_typ == obs_typ) & valid_pairs
+                num_match = match.to(torch.float32).sum(dim=(-1, -2))  # [B,C]
+                num_pairs = valid_pairs.to(torch.float32).sum(dim=(-1, -2)).clamp_min(1.0)  # [B,1]
+                num_mis = num_pairs - num_match
+
+                log_p_match = torch.log1p(-eps).unsqueeze(1)  # [B,1]
+                # 3-state categorical flip: mismatch prob is eps/2
+                log_p_mis = (torch.log(eps) - math.log(2.0)).unsqueeze(1)  # [B,1]
+                loglik = num_match * log_p_match + num_mis * log_p_mis
+
+                # mask invalid candidates
+                loglik = loglik.masked_fill(~cand_mask, -1e9)
+                q = torch.softmax(loglik, dim=-1)  # [B,C]
+
+                logp = torch.log(out_eb.probs.clamp_min(1e-12))
+                per = -(q * logp).sum(dim=-1)  # [B]
+                w_eff = (keep * w_tt1).to(torch.float32)
+                loss_eb = (per.to(torch.float32) * w_eff).sum() / (w_eff.sum() + 1e-6)
+
+            elif A_t1 is not None:
+                # Hard oracle cross-entropy (leaky; kept for backwards compatibility).
                 oracle_idx = self.ebstm.oracle_index(out_eb.candidate_A, A_t1)
                 logp_oracle = torch.log(out_eb.probs[torch.arange(B, device=agents_hist.device), oracle_idx] + 1e-8)
-                loss_eb = -logp_oracle.mean()
+                loss_eb = -logp_oracle.mean().to(torch.float32)
 
+            # ------------------------------------------------------------------
+            # Structure metrics (oracle only; computed from future labels)
+            # ------------------------------------------------------------------
+            if A_t1 is not None:
                 with torch.no_grad():
                     pred_idx = out_eb.energies.argmin(dim=1)
                     A_pred = out_eb.candidate_A[torch.arange(B, device=agents_hist.device), pred_idx]
+
+                    # Exact match
                     struct_acc = (A_pred == A_t1).all(dim=-1).all(dim=-1).float().mean()
+
+                    # (Req-9) Directed edge precision/recall/F1
+                    node_mask = eb_mask.to(torch.bool)  # [B,K]
+                    eye = torch.eye(A_pred.shape[-1], device=A_pred.device, dtype=torch.bool).unsqueeze(0)
+                    mask_dir = node_mask.unsqueeze(-1) & node_mask.unsqueeze(-2) & (~eye)
+
+                    pred_edge = (A_pred > 0.5)
+                    true_edge = (A_t1 > 0.5)
+                    tp = (pred_edge & true_edge & mask_dir).sum().to(torch.float32)
+                    fp = (pred_edge & (~true_edge) & mask_dir).sum().to(torch.float32)
+                    fn = ((~pred_edge) & true_edge & mask_dir).sum().to(torch.float32)
+                    struct_edge_prec = tp / (tp + fp + 1e-9)
+                    struct_edge_rec = tp / (tp + fn + 1e-9)
+                    struct_edge_f1 = 2.0 * struct_edge_prec * struct_edge_rec / (struct_edge_prec + struct_edge_rec + 1e-9)
+
+                    # (Req-9) Pairwise 3-state accuracy over unordered pairs (i<j)
+                    typ_pred = self.ebstm._relation_state3(A_pred)  # [B,K,K]
+                    typ_true = self.ebstm._relation_state3(A_t1)
+                    triu = torch.triu(torch.ones_like(typ_pred, dtype=torch.bool), diagonal=1)
+                    mask_pair = node_mask.unsqueeze(-1) & node_mask.unsqueeze(-2) & triu
+                    struct_pair_acc = ((typ_pred == typ_true) & mask_pair).sum().to(torch.float32) / mask_pair.sum().clamp_min(1).to(torch.float32)
+
+                    # (Req-5 helper) Oracle edit distance between current A_t and oracle A_{t+Δ}
+                    typ0 = self.ebstm._relation_state3(A_t)
+                    oracle_edit_distance = ((typ0 != typ_true) & mask_pair).sum(dim=(-1, -2)).to(torch.float32).mean()
             else:
-                loss_eb = torch.zeros((), device=agents_hist.device, dtype=agents_hist.dtype)
                 struct_acc = torch.tensor(float("nan"), device=agents_hist.device, dtype=agents_hist.dtype)
+                struct_edge_prec = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+                struct_edge_rec = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+                struct_edge_f1 = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+                struct_pair_acc = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+                oracle_edit_distance = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
 
             # -------------------------------------------------
             # Counterfactual conservatism regularizer (optional)
@@ -427,12 +610,64 @@ class PrefWorldModel(nn.Module):
                     # average only over valid cf items
                     loss_cf = loss_cf + (kl * cf_mask).sum() / (cf_mask.sum() + 1e-6)
 
-            loss_eb_total = loss_eb + float(eb_cf_weight) * loss_cf
+            # -------------------------------------------------
+            # Preference-sensitivity regularizer (prevents ignoring z)
+            # -------------------------------------------------
+            loss_eb_pref_sens = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
+            if float(eb_pref_sens_weight) > 0.0 and A_t1 is not None:
+                # Shuffle non-ego beliefs; if EB-STM is using preferences, the oracle should become less likely.
+                z_mean_shuf, z_logvar_shuf, did_shuf = self._shuffle_non_ego_beliefs(z_mean_eb, z_logvar_eb, eb_mask)
+                if did_shuf.any():
+                    out_shuf = self.ebstm(
+                        A_t,
+                        eb_feat,
+                        z_mean_shuf,
+                        z_logvar_shuf,
+                        eb_mask,
+                        oracle_next=A_t1,
+                        smooth_scale=float(eb_smooth_scale),
+                        phys_dist_threshold_m=float(eb_phys_dist_threshold_m),
+                        phys_penalty_scale=float(eb_phys_penalty_scale),
+                    )
+                    lp_shuf = torch.log(out_shuf.probs[torch.arange(B, device=agents_hist.device), oracle_idx] + 1e-8)
+                    # Maximize drop in oracle log-prob (margin ranking)
+                    margin = float(eb_pref_sens_margin)
+                    delta_lp = logp_oracle - lp_shuf
+                    per = F.relu(margin - delta_lp)
+                    w = did_shuf.to(per.dtype)
+                    loss_eb_pref_sens = (per * w).sum() / (w.sum() + 1e-6)
+
+            # -------------------------------------------------
+            # Base-energy regularizer (encourage relying on preference terms)
+            # -------------------------------------------------
+            loss_eb_base_l2 = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
+            if float(eb_base_l2_weight) > 0.0:
+                base = getattr(out_eb.pair_energies, 'base_edit', None)
+                if base is not None:
+                    Kk = base.shape[1]
+                    triu = torch.triu(torch.ones((Kk, Kk), device=base.device, dtype=torch.bool), diagonal=1)
+                    valid = (out_eb.pair_energies.pair_mask & triu).unsqueeze(-1)
+                    denom = valid.to(torch.float32).sum().clamp_min(1e-6)
+                    loss_eb_base_l2 = ((base.to(torch.float32) ** 2) * valid.to(torch.float32)).sum() / denom
+
+            loss_eb_total = (
+                loss_eb
+                + float(eb_cf_weight) * loss_cf
+                + float(eb_pref_sens_weight) * loss_eb_pref_sens
+                + float(eb_base_l2_weight) * loss_eb_base_l2
+            )
         else:
             loss_eb = torch.zeros((), device=agents_hist.device, dtype=agents_hist.dtype)
             struct_acc = torch.zeros((), device=agents_hist.device, dtype=agents_hist.dtype)
+            struct_edge_prec = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+            struct_edge_rec = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+            struct_edge_f1 = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+            struct_pair_acc = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
+            oracle_edit_distance = torch.tensor(float("nan"), device=agents_hist.device, dtype=torch.float32)
             out_eb = None
             loss_cf = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
+            loss_eb_pref_sens = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
+            loss_eb_base_l2 = torch.zeros((), device=agents_hist.device, dtype=torch.float32)
             loss_eb_total = loss_eb
 
         # -----------------------------
@@ -443,11 +678,20 @@ class PrefWorldModel(nn.Module):
             "loss_intent": loss_intent,
             "loss_eb": loss_eb,
             "loss_eb_cf": loss_cf,
+            "loss_eb_pref_sens": loss_eb_pref_sens,
+            "loss_eb_base_l2": loss_eb_base_l2,
             "loss_eb_total": loss_eb_total,
         }
         metrics: Dict[str, torch.Tensor] = {
             "intent_acc": acc,
             "struct_exact": struct_acc,
+            # (Req-9)
+            "struct_edge_precision": struct_edge_prec,
+            "struct_edge_recall": struct_edge_rec,
+            "struct_edge_f1": struct_edge_f1,
+            "struct_pair_acc": struct_pair_acc,
+            # (Req-5 helper)
+            "oracle_edit_distance": oracle_edit_distance,
         }
         aux: Dict[str, torch.Tensor] = {
             "maneuver_logits_last": maneuver_logits_last.detach(),

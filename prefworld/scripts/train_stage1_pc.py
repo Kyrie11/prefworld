@@ -223,11 +223,43 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(tcfg.get("grad_clip_norm", 5.0)))
             optimizer.step()
 
+            # --------------------------------------------------------------
+            # Diagnostics (Req-4): maneuver posterior entropy & z posterior std
+            # --------------------------------------------------------------
+            with torch.no_grad():
+                m_logits = out.aux.get("maneuver_logits_last", None)
+                z_logvar = out.aux.get("z_logvar", None)
+                agents_valid_last = (agents_hist_mask[:, :, -1] > 0.5)
+
+                H_mean = float("nan")
+                H_p50 = float("nan")
+                zstd_mean = float("nan")
+                zstd_p50 = float("nan")
+
+                if m_logits is not None:
+                    p = torch.softmax(m_logits, dim=-1)
+                    H = -(p * torch.log(p.clamp_min(1e-12))).sum(dim=-1)  # [B,N]
+                    Hv = H[agents_valid_last]
+                    if Hv.numel() > 0:
+                        H_mean = float(Hv.mean().item())
+                        H_p50 = float(torch.quantile(Hv, 0.5).item())
+
+                if z_logvar is not None:
+                    zstd = torch.exp(0.5 * z_logvar).mean(dim=-1)  # [B,N]
+                    zv = zstd[agents_valid_last]
+                    if zv.numel() > 0:
+                        zstd_mean = float(zv.mean().item())
+                        zstd_p50 = float(torch.quantile(zv, 0.5).item())
+
             pbar.set_postfix(
                 loss=float(loss.item()),
                 q_nll=float(out.losses.get("loss_pc_query_nll", torch.tensor(0.0)).item()),
                 kl=float(out.losses.get("loss_pc_kl_ctx_prior", torch.tensor(0.0)).item()),
                 con=float(out.losses.get("loss_pc_contrastive", torch.tensor(0.0)).item()),
+                H=float(H_mean),
+                H50=float(H_p50),
+                zstd=float(zstd_mean),
+                z50=float(zstd_p50),
             )
 
             epoch_loss_sum += float(loss.item())

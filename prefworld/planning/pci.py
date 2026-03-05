@@ -113,6 +113,10 @@ def compute_pci_scores(
     # Paper Eq.(30): epsilon smoothing for beam/search rollouts
     smooth_eps: float = 1e-6,
     dt: float = 0.5,
+    # Support coverage: optionally mix in baseline-proposed rollouts so that counterfactual
+    # distributions are less likely to place mass outside the shared rollout set.
+    mix_baseline_support: bool = True,
+    num_rollouts_baseline: int = 16,
 ) -> PCIResult:
     """Compute PCI using shared rollout support + *factorized* counterfactual reweighting.
 
@@ -128,6 +132,12 @@ def compute_pci_scores(
     """
     B, K, _ = A_t.shape
     H = int(horizon_steps)
+
+
+    # Baseline belief (same for all agents) used both for counterfactuals and optional support mixing.
+    mu0 = torch.full_like(z_mean, float(baseline_mean))
+    lv0 = torch.full_like(z_logvar, float(baseline_logvar))
+
 
     # --- Shared rollout support under full belief ---
     if use_beam_rollout:
@@ -156,6 +166,32 @@ def compute_pci_scores(
 
     S = rollouts.shape[1]
 
+    # --- Optional: mix in baseline-proposed rollouts for better support coverage ---
+    if bool(mix_baseline_support) and int(num_rollouts_baseline) > 0:
+        # Propose additional sequences under the baseline belief.
+        roll_b, _, _ = ebstm.rollout(
+            A_t,
+            agent_feat,
+            mu0,
+            lv0,
+            agent_mask,
+            horizon_steps=H,
+            num_samples=int(num_rollouts_baseline),
+            return_indices=False,
+        )
+        # Evaluate those sequences under the *full* belief so p_full remains correct.
+        logp_b_full = ebstm.rollout_log_prob(
+            A_t,
+            roll_b,
+            agent_feat,
+            z_mean,
+            z_logvar,
+            agent_mask,
+        )
+        rollouts = torch.cat([rollouts, roll_b], dim=1)
+        logp_full = torch.cat([logp_full, logp_b_full], dim=1)
+        S = rollouts.shape[1]
+
     # rollout distribution under full belief
     if use_model_probs:
         p_full = _normalize_log_weights(logp_full)  # [B,S]
@@ -182,8 +218,6 @@ def compute_pci_scores(
     lv_j = z_logvar.unsqueeze(1).expand(B, K, K, -1)
 
     # baseline belief (same for all agents)
-    mu0 = torch.full_like(z_mean, float(baseline_mean))
-    lv0 = torch.full_like(z_logvar, float(baseline_logvar))
     mu0_i = mu0.unsqueeze(2).expand(B, K, K, -1)
     lv0_i = lv0.unsqueeze(2).expand(B, K, K, -1)
     mu0_j = mu0.unsqueeze(1).expand(B, K, K, -1)

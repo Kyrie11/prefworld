@@ -58,6 +58,8 @@ def main() -> None:
         energy_hidden=int(getattr(cfg.model, "energy_hidden", 128)),
         eb_temperature=float(getattr(cfg.model, "eb_temperature", 1.0)),
         eb_max_candidates=int(getattr(cfg.model, "eb_max_candidates", 64)),
+        eb_two_step_topk_pairs=int(getattr(cfg.model, "eb_two_step_topk_pairs", 0)),
+        eb_two_step_beam_size=int(getattr(cfg.model, "eb_two_step_beam_size", 24)),
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.optim.lr), weight_decay=float(cfg.optim.weight_decay))
@@ -82,6 +84,10 @@ def main() -> None:
         w_eb=float(getattr(cfg.train, "w_eb", 1.0)),
         # Old w_kl mapped to λ_prior (roughly)
         lambda_prior=float(getattr(cfg.train, "lambda_prior", getattr(cfg.train, "w_kl", 0.1))),
+        # EB regularizers
+        eb_pref_sens_weight=float(getattr(cfg.train, "eb_pref_sens_weight", 0.0)),
+        eb_pref_sens_margin=float(getattr(cfg.train, "eb_pref_sens_margin", 0.2)),
+        eb_base_l2_weight=float(getattr(cfg.train, "eb_base_l2_weight", 0.0)),
     )
 
     train(model, train_loader, val_loader, optimizer, tcfg, device)

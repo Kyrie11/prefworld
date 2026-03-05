@@ -54,6 +54,12 @@ train:
   free_bits: 0.0
 
   # EB penalties
+  # --- New: regularize EB-STM to actually use preference beliefs ---
+  eb_pref_sens_weight: 0.0
+  eb_pref_sens_margin: 0.2
+  eb_base_l2_weight: 0.0
+
+  # EB penalties
   eb_smooth_scale: 0.1
   eb_phys_dist_threshold_m: 50.0
   eb_phys_penalty_scale: 1.0

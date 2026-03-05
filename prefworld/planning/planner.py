@@ -17,8 +17,24 @@ from prefworld.planning.mpc import BicycleState, mpc_track, mpc_track_robust, ro
 
 @dataclass
 class PlannerConfig:
-    horizon_steps: int = 30
+    horizon_steps: int = 80
     dt: float = 0.1
+    # Structure time step (EB-STM) Δt_s; typically 0.5s for nuPlan cached sampling.
+    structure_dt: float = 0.5
+    # If set, overrides derived structure horizon steps (otherwise derived from horizon_steps*dt/structure_dt).
+    structure_horizon_steps: Optional[int] = None
+    # Optional predictability-adaptive horizon stopping (transition entropy threshold).
+    structure_entropy_stop_threshold: Optional[float] = None
+    structure_min_horizon_steps: int = 1
+
+    # (Req-6) Predictability-adaptive horizon refinement:
+    # Stop expanding the structure horizon only when BOTH
+    #   (entropy > structure_entropy_stop_threshold) AND (risk_proxy < structure_risk_stop_threshold).
+    # Set to None to disable the risk term (entropy-only truncation).
+    structure_risk_stop_threshold: Optional[float] = None
+    structure_risk_horizon_s: float = 3.0
+    structure_risk_sigma_dist: float = 6.0
+
     num_structure_samples: int = 32
     use_beam: bool = False
     beam_size: int = 16
@@ -40,6 +56,8 @@ class PlannerConfig:
     pci_coarse_actions: Tuple[int, ...] = (int(Maneuver.KEEP), int(Maneuver.LANE_CHANGE_LEFT), int(Maneuver.LANE_CHANGE_RIGHT))
     pci_horizon_steps: int = 12
     pci_num_structure_samples: int = 32
+    pci_mix_baseline_support: bool = True
+    pci_num_rollouts_baseline: int = 16
     pci_use_beam: bool = False
     pci_beam_size: int = 16
     pci_fallback_k: int = 2
@@ -48,6 +66,17 @@ class PlannerConfig:
     cvar_alpha: float = 0.9
     w_exp_risk: float = 1.0
     w_cvar_risk: float = 1.0
+
+    # (Req-7) nuPlan-competition-style secondary objectives (lightweight proxies).
+    # Defaults are 0.0 (disabled) so existing behavior is unchanged.
+    w_progress: float = 0.0
+    w_drivable: float = 0.0
+    w_direction: float = 0.0
+    w_speed_limit: float = 0.0
+    w_comfort: float = 0.0
+    drivable_threshold_m: float = 2.0
+    direction_cos_threshold: float = 0.0
+    speed_limit_mps: float = 13.9  # ~50 km/h
 
     # Agent rollout model (planner-side approximation)
     # If enabled, we roll out simple maneuver-conditioned primitives for other agents
@@ -146,6 +175,31 @@ def plan_with_structures(
     device = next(model.parameters()).device
     batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
+    # ------------------------------------------------------------------
+    # Time-scale separation (paper-aligned):
+    #   - motion dt (MPC / trajectories)
+    #   - structure dt (EB-STM transitions / PCI)
+    # ------------------------------------------------------------------
+    motion_dt = float(cfg.dt)
+    H_motion = int(cfg.horizon_steps)
+
+    structure_dt = float(getattr(cfg, 'structure_dt', motion_dt) or motion_dt)
+    if structure_dt <= 0.0:
+        structure_dt = motion_dt
+
+    ratio = structure_dt / max(1e-6, motion_dt)
+    K_m = max(1, int(round(ratio)))
+    if abs(ratio - K_m) > 1e-3:
+        # Snap to an integer multiple for deterministic indexing.
+        K_m = max(1, int(math.floor(ratio + 1e-6)))
+        structure_dt = motion_dt * K_m
+
+    H_structure = getattr(cfg, 'structure_horizon_steps', None)
+    if H_structure is None:
+        # cover the motion horizon in structure steps
+        H_structure = int(math.ceil((H_motion * motion_dt) / max(1e-6, structure_dt)))
+    H_structure = max(1, int(H_structure))
+
     # Run the model once to get posterior preferences.
     # NOTE: PrefWorldModel.forward does not take pc_drop_prob; we use pc_query_ratio=0 to
     # condition on the full observed history when planning.
@@ -240,7 +294,9 @@ def plan_with_structures(
                 use_model_probs=True,
                 cvar_alpha=float(cfg.cvar_alpha),
                 smooth_eps=float(cfg.pci_smooth_eps),
-                dt=float(cfg.dt),
+                dt=float(structure_dt),
+                mix_baseline_support=bool(getattr(cfg, "pci_mix_baseline_support", True)),
+                num_rollouts_baseline=int(getattr(cfg, "pci_num_rollouts_baseline", 16)),
             )
 
             better = pci_res.pci > pci_max
@@ -303,10 +359,13 @@ def plan_with_structures(
                 z_mean_mixed,
                 z_logvar_mixed,
                 eb_mask,
-                max_horizon_steps=int(cfg.horizon_steps),
+                max_horizon_steps=int(H_structure),
                 beam_size=int(cfg.beam_size),
-                entropy_stop_threshold=None,
-                min_horizon_steps=1,
+                entropy_stop_threshold=(None if getattr(cfg, "structure_entropy_stop_threshold", None) is None else float(getattr(cfg, "structure_entropy_stop_threshold"))),
+                min_horizon_steps=int(getattr(cfg, "structure_min_horizon_steps", 1)),
+                risk_stop_threshold=(None if getattr(cfg, "structure_risk_stop_threshold", None) is None else float(getattr(cfg, "structure_risk_stop_threshold"))),
+                risk_horizon_s=float(getattr(cfg, "structure_risk_horizon_s", 3.0)),
+                risk_sigma_dist=float(getattr(cfg, "structure_risk_sigma_dist", 6.0)),
             )
             # [B,S,H,K,K]
             S = roll.shape[1]
@@ -318,9 +377,14 @@ def plan_with_structures(
                 z_mean_mixed,
                 z_logvar_mixed,
                 eb_mask,
-                horizon_steps=int(cfg.horizon_steps),
+                horizon_steps=int(H_structure),
                 num_samples=int(cfg.num_structure_samples),
                 return_indices=False,
+                entropy_stop_threshold=(None if getattr(cfg, "structure_entropy_stop_threshold", None) is None else float(getattr(cfg, "structure_entropy_stop_threshold"))),
+                min_horizon_steps=int(getattr(cfg, "structure_min_horizon_steps", 1)),
+                risk_stop_threshold=(None if getattr(cfg, "structure_risk_stop_threshold", None) is None else float(getattr(cfg, "structure_risk_stop_threshold"))),
+                risk_horizon_s=float(getattr(cfg, "structure_risk_horizon_s", 3.0)),
+                risk_sigma_dist=float(getattr(cfg, "structure_risk_sigma_dist", 6.0)),
             )
             S = roll.shape[1]
             p = torch.softmax(logp, dim=-1)
@@ -329,7 +393,7 @@ def plan_with_structures(
         # Risk: collision probability (exp + CVaR) via constant-velocity rollouts
         # conditioned on sampled interaction structures.
         # ------------------------------------------------------------------
-        ego_ref_xy, _ = _ego_reference_primitive(
+        ego_ref_xy, ego_ref_yaw = _ego_reference_primitive(
             ego_speed,
             int(m),
             horizon_steps=int(cfg.horizon_steps),
@@ -369,6 +433,7 @@ def plan_with_structures(
 
         Hh = int(cfg.horizon_steps)
         S = roll.shape[1]
+        Hs = roll.shape[2]  # structure horizon
         dtype = ego_ref_xy.dtype
 
         # Primitive shaping functions over time
@@ -425,7 +490,8 @@ def plan_with_structures(
         traj = torch.zeros((B, S, N, Hh, 2), device=device, dtype=dtype)
         for h in range(Hh):
             # If agent yields to ego at this step, it slows down (keeps the minimum scale).
-            yield_mask = (roll[:, :, h, 1:, 0] > 0.5)  # [B,S,N]
+            s_idx = min(int(h // K_m), int(Hs) - 1)
+            yield_mask = (roll[:, :, s_idx, 1:, 0] > 0.5)  # [B,S,N] (structure step)
             scale = torch.minimum(scale, torch.where(yield_mask, torch.full_like(scale, slowdown), torch.ones_like(scale)))
 
             v_eff = v_t[:, :, h].unsqueeze(1) * scale  # [B,S,N]
@@ -442,7 +508,8 @@ def plan_with_structures(
             scale = torch.ones((B, S, N), device=device, dtype=dtype)
             traj = torch.zeros((B, S, N, Hh, 2), device=device, dtype=dtype)
             for h in range(Hh):
-                yield_mask = (roll[:, :, h, 1:, 0] > 0.5)
+                s_idx = min(int(h // K_m), int(Hs) - 1)
+                yield_mask = (roll[:, :, s_idx, 1:, 0] > 0.5)
                 scale = torch.minimum(scale, torch.where(yield_mask, torch.full_like(scale, slowdown), torch.ones_like(scale)))
                 pos = pos + vel * scale.unsqueeze(-1) * float(cfg.dt)
                 traj[:, :, :, h, :] = pos
@@ -456,6 +523,81 @@ def plan_with_structures(
         )
 
         score = float(cfg.w_exp_risk) * exp_risk + float(cfg.w_cvar_risk) * cvar_r
+
+        # ------------------------------------------------------------------
+        # (Req-7) nuPlan-competition-style secondary objectives (lightweight proxies)
+        # ------------------------------------------------------------------
+        if any(float(getattr(cfg, k, 0.0)) > 0.0 for k in ("w_progress", "w_drivable", "w_direction", "w_speed_limit", "w_comfort")):
+            # Progress proxy: maximize forward displacement in ego frame.
+            if float(getattr(cfg, "w_progress", 0.0)) > 0.0:
+                progress = ego_ref_xy[:, -1, 0]  # [B]
+                score = score + float(cfg.w_progress) * (-progress)
+
+            # Speed limit compliance proxy
+            if float(getattr(cfg, "w_speed_limit", 0.0)) > 0.0:
+                vel = (ego_ref_xy[:, 1:, :] - ego_ref_xy[:, :-1, :]) / float(cfg.dt)
+                speed = torch.norm(vel, dim=-1)
+                exceed = F.relu(speed - float(getattr(cfg, "speed_limit_mps", 13.9)))
+                score = score + float(cfg.w_speed_limit) * exceed.mean(dim=-1)
+
+            # Comfort proxy: penalize large accel + jerk magnitudes
+            if float(getattr(cfg, "w_comfort", 0.0)) > 0.0:
+                vel = (ego_ref_xy[:, 1:, :] - ego_ref_xy[:, :-1, :]) / float(cfg.dt)
+                speed = torch.norm(vel, dim=-1)
+                if speed.shape[1] >= 3:
+                    accel = (speed[:, 1:] - speed[:, :-1]) / float(cfg.dt)
+                    jerk = (accel[:, 1:] - accel[:, :-1]) / float(cfg.dt)
+                    comfort = accel.abs().mean(dim=-1) + 0.5 * jerk.abs().mean(dim=-1)
+                elif speed.shape[1] >= 2:
+                    accel = (speed[:, 1:] - speed[:, :-1]) / float(cfg.dt)
+                    comfort = accel.abs().mean(dim=-1)
+                else:
+                    comfort = torch.zeros((B,), device=device, dtype=torch.float32)
+                score = score + float(cfg.w_comfort) * comfort
+
+            # Drivable-area / driving-direction proxies using map polylines in ego frame.
+            if float(getattr(cfg, "w_drivable", 0.0)) > 0.0 or float(getattr(cfg, "w_direction", 0.0)) > 0.0:
+                # Sample at a coarse stride for efficiency.
+                stride = 4
+                ego_pts = ego_ref_xy[:, ::stride, :]  # [B,He,2]
+                ego_yaw_s = ego_ref_yaw[:, ::stride]
+
+                Bm, M, L, _ = map_polylines.shape
+                if Bm != B:
+                    raise ValueError("Batch size mismatch between ego_ref_xy and map_polylines")
+
+                # Flatten map points.
+                map_pts = map_polylines.reshape(B, M * L, 2)
+                map_valid = map_poly_mask.unsqueeze(-1).expand(B, M, L).reshape(B, M * L) > 0.5
+
+                if map_valid.any():
+                    # Distance from ego samples to map points.
+                    dist_mat = torch.cdist(ego_pts, map_pts)  # [B,He,P]
+                    dist_mat = dist_mat.masked_fill(~map_valid.unsqueeze(1), float("inf"))
+                    min_dist, min_idx = dist_mat.min(dim=-1)  # [B,He]
+
+                    if float(getattr(cfg, "w_drivable", 0.0)) > 0.0:
+                        thr = float(getattr(cfg, "drivable_threshold_m", 2.0))
+                        drivable_violation = F.relu(min_dist - thr)
+                        score = score + float(cfg.w_drivable) * drivable_violation.mean(dim=-1)
+
+                    if float(getattr(cfg, "w_direction", 0.0)) > 0.0:
+                        # Compute per-point map direction (approx) by finite differences along polyline.
+                        d = map_polylines[:, :, 1:, :] - map_polylines[:, :, :-1, :]
+                        dir_pts = torch.zeros_like(map_polylines)
+                        dir_pts[:, :, :-1, :] = d
+                        if L >= 2:
+                            dir_pts[:, :, -1, :] = d[:, :, -1, :]
+                        dir_flat = dir_pts.reshape(B, M * L, 2)
+                        dir_flat = F.normalize(dir_flat, dim=-1, eps=1e-6)
+
+                        # Gather nearest map direction for each ego sample.
+                        nn_dir = dir_flat.gather(1, min_idx.unsqueeze(-1).expand(-1, -1, 2))  # [B,He,2]
+                        ego_dir = torch.stack([torch.cos(ego_yaw_s), torch.sin(ego_yaw_s)], dim=-1)
+                        dot = (nn_dir * ego_dir).sum(dim=-1)  # [B,He]
+                        thr_cos = float(getattr(cfg, "direction_cos_threshold", 0.0))
+                        dir_violation = F.relu(thr_cos - dot)
+                        score = score + float(cfg.w_direction) * dir_violation.mean(dim=-1)
 
         # Enforce feasible maneuver set (if provided by the template encoder)
         if bool(cfg.respect_feasible_actions) and ego_feasible is not None:
@@ -489,20 +631,31 @@ def plan_with_structures(
 
     # MPC tracking for the chosen maneuver
 
-    # build per-batch reference trajectories
-    ref_xy_list = []
-    ref_yaw_list = []
+    # ------------------------------------------------------------------
+    # Build per-batch *full-horizon* reference trajectories.
+    #
+    # nuPlan closed-loop expects ~8s@10Hz => 80 future steps + current.
+    # We therefore output H_out = horizon_steps + 1 points (t=0 included).
+    # ------------------------------------------------------------------
+    H_out = int(cfg.horizon_steps) + 1
+    ref_xy_full_list = []
+    ref_yaw_full_list = []
     for b in range(B):
         ref_xy_b, ref_yaw_b = _ego_reference_primitive(
             ego_speed[b : b + 1],
             int(best_m[b].item()),
-            int(cfg.mpc_horizon_steps),
+            int(H_out),
             float(cfg.dt),
         )
-        ref_xy_list.append(ref_xy_b)
-        ref_yaw_list.append(ref_yaw_b)
-    ref_xy = torch.cat(ref_xy_list, dim=0)    # [B,H,2]
-    ref_yaw = torch.cat(ref_yaw_list, dim=0)  # [B,H]
+        ref_xy_full_list.append(ref_xy_b)
+        ref_yaw_full_list.append(ref_yaw_b)
+    ref_xy_full = torch.cat(ref_xy_full_list, dim=0)    # [B,H_out,2]
+    ref_yaw_full = torch.cat(ref_yaw_full_list, dim=0)  # [B,H_out]
+
+    # MPC reference: align with rollout_bicycle outputs which start at t=dt.
+    H_mpc = int(cfg.mpc_horizon_steps)
+    ref_xy = ref_xy_full[:, 1 : 1 + H_mpc]
+    ref_yaw = ref_yaw_full[:, 1 : 1 + H_mpc]
 
     state0 = BicycleState(
         x=torch.zeros((B,), device=device, dtype=ref_xy.dtype),
@@ -562,16 +715,37 @@ def plan_with_structures(
     ego_traj_yaw: Optional[torch.Tensor]
     if controls is not None:
         st = rollout_bicycle(state0, controls, dt=float(cfg.dt))
-        xy = torch.stack([st.x, st.y], dim=-1)  # [B,H,2]
-        yaw = st.yaw  # [B,H]
-        zero_xy = torch.zeros((B, 1, 2), device=xy.device, dtype=xy.dtype)
-        zero_yaw = torch.zeros((B, 1), device=yaw.device, dtype=yaw.dtype)
-        ego_traj_xy = torch.cat([zero_xy, xy], dim=1)
-        ego_traj_yaw = torch.cat([zero_yaw, yaw], dim=1)
+        xy_exec = torch.stack([st.x, st.y], dim=-1)  # [B,H_mpc,2] at t=dt..H_mpc*dt
+        yaw_exec = st.yaw                             # [B,H_mpc]
+        zero_xy = torch.zeros((B, 1, 2), device=xy_exec.device, dtype=xy_exec.dtype)
+        zero_yaw = torch.zeros((B, 1), device=yaw_exec.device, dtype=yaw_exec.dtype)
+        xy_exec = torch.cat([zero_xy, xy_exec], dim=1)   # [B,H_mpc+1]
+        yaw_exec = torch.cat([zero_yaw, yaw_exec], dim=1)
+
+        # Extend to full horizon by appending a shifted reference tail.
+        if xy_exec.shape[1] >= H_out:
+            ego_traj_xy = xy_exec[:, :H_out]
+            ego_traj_yaw = yaw_exec[:, :H_out]
+        else:
+            anchor_idx = xy_exec.shape[1] - 1
+            ref_anchor_xy = ref_xy_full[:, anchor_idx, :]
+            ref_anchor_yaw = ref_yaw_full[:, anchor_idx]
+            exec_anchor_xy = xy_exec[:, anchor_idx, :]
+            exec_anchor_yaw = yaw_exec[:, anchor_idx]
+
+            delta_xy = ref_xy_full[:, anchor_idx:, :] - ref_anchor_xy.unsqueeze(1)
+            delta_yaw = ref_yaw_full[:, anchor_idx:] - ref_anchor_yaw.unsqueeze(1)
+
+            tail_xy = exec_anchor_xy.unsqueeze(1) + delta_xy
+            tail_yaw = exec_anchor_yaw.unsqueeze(1) + delta_yaw
+
+            # Remove duplicated anchor point.
+            ego_traj_xy = torch.cat([xy_exec, tail_xy[:, 1:]], dim=1)
+            ego_traj_yaw = torch.cat([yaw_exec, tail_yaw[:, 1:]], dim=1)
     else:
-        # Fallback: output the reference trajectory.
-        ego_traj_xy = ref_xy
-        ego_traj_yaw = ref_yaw
+        # Fallback: output the reference trajectory (already full-horizon).
+        ego_traj_xy = ref_xy_full
+        ego_traj_yaw = ref_yaw_full
 
     return PlannerOutput(
         best_maneuver=best_m,

@@ -58,6 +58,22 @@ class EBSTM(nn.Module):
         conflict_horizon_s: float = 3.0,
         conflict_dist_threshold: float = 6.0,
         use_closest_approach_candidates: bool = True,
+        # ------------------------------------------------------------------
+        # Candidate expansion (Req-5): allow *two-step* edit combinations.
+        #
+        # Motivation: the oracle next structure A_{t+Δ} may differ from A_t
+        # by >1 unordered-pair edits. If the candidate set only allows a single
+        # edit token, the oracle is often out-of-support.
+        #
+        # We implement a small beam search over edit tokens (depth=2) restricted
+        # to the most relevant unordered pairs (top-k by pair relevance score).
+        # The resulting candidates are merged with the standard one-step edits
+        # and truncated to max_candidates.
+        #
+        # Set two_step_topk_pairs=0 to disable.
+        # ------------------------------------------------------------------
+        two_step_topk_pairs: int = 0,
+        two_step_beam_size: int = 24,
         # Additional uncertainty penalty at the *structure* level (0 disables; EFEN already includes one).
         uncertainty_penalty_scale: float = 0.0,
     ):
@@ -70,6 +86,8 @@ class EBSTM(nn.Module):
         self.conflict_horizon_s = float(conflict_horizon_s)
         self.conflict_dist_threshold = float(conflict_dist_threshold)
         self.use_closest_approach_candidates = bool(use_closest_approach_candidates)
+        self.two_step_topk_pairs = int(two_step_topk_pairs)
+        self.two_step_beam_size = int(two_step_beam_size)
         self.uncertainty_penalty_scale = float(uncertainty_penalty_scale)
 
 
@@ -226,6 +244,9 @@ class EBSTM(nn.Module):
           - Candidate 0: keep A_t (NOOP token)
           - Other candidates: apply exactly one local edit on a valid close pair (i,j):
               add i->j, add j->i, delete, flip direction.
+
+        If two_step_topk_pairs>0, we additionally include *two-step* edit combinations
+        via a small beam search over edit tokens restricted to top-k relevant pairs.
         """
         B, K, _ = A_t.shape
         dist = self._pair_distance(agent_feat)  # [B,K,K]
@@ -240,12 +261,14 @@ class EBSTM(nn.Module):
             db = dist[b]
             dmb = dmin[b] if dmin is not None else db
 
+            # Candidate list (prioritized). Always include NOOP.
             cand: List[torch.Tensor] = [Ab.clone()]
 
             # Enumerate candidate unordered pairs (i<j).
             # We include pairs that are either currently close OR have a small
             # closest-approach distance within a short horizon.
             pairs: List[Tuple[int, int]] = []
+            pair_scores: List[float] = []
             if K > 1:
                 tri = torch.triu_indices(K, K, offset=1, device=Ab.device)
                 ii = tri[0]
@@ -267,51 +290,113 @@ class EBSTM(nn.Module):
                     if not torch.isfinite(score[idx]).item():
                         continue
                     pairs.append((int(ii[idx].item()), int(jj[idx].item())))
+                    pair_scores.append(float(score[idx].item()))
 
+            # ------------------------------------------------------------------
+            # Helper: enumerate *possible* single-pair edits.
+            # ------------------------------------------------------------------
+            def _pair_state(A: torch.Tensor, i: int, j: int) -> int:
+                a_ij = int(A[i, j].item() > 0.5)
+                a_ji = int(A[j, i].item() > 0.5)
+                if a_ij == 0 and a_ji == 0:
+                    return 0
+                if a_ij == 1 and a_ji == 0:
+                    return 1
+                if a_ij == 0 and a_ji == 1:
+                    return 2
+                return 3
+
+            def _set_pair_state(A: torch.Tensor, i: int, j: int, state: int) -> torch.Tensor:
+                A2 = A.clone()
+                if state == 0:
+                    A2[i, j] = 0
+                    A2[j, i] = 0
+                elif state == 1:
+                    A2[i, j] = 1
+                    A2[j, i] = 0
+                elif state == 2:
+                    A2[i, j] = 0
+                    A2[j, i] = 1
+                else:
+                    # invalid "both" state is never produced
+                    A2[i, j] = 0
+                    A2[j, i] = 0
+                return A2
+
+            def _single_edits(A: torch.Tensor, i: int, j: int) -> List[torch.Tensor]:
+                s = _pair_state(A, i, j)
+                # Only allow transitions among the valid 3 states.
+                # If the current state is invalid (both), treat it as NONE.
+                if s == 3:
+                    s = 0
+                outA: List[torch.Tensor] = []
+                for tgt in (0, 1, 2):
+                    if tgt == s:
+                        continue
+                    A2 = _set_pair_state(A, i, j, tgt)
+                    if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
+                        outA.append(A2)
+                return outA
+
+            # ------------------------------------------------------------------
+            # (Req-5) Two-step edit combos via beam over edits (depth=2)
+            # ------------------------------------------------------------------
+            if self.two_step_topk_pairs > 0 and len(pairs) > 0:
+                topk = min(int(self.two_step_topk_pairs), len(pairs))
+                beam_size = max(1, min(int(self.two_step_beam_size), int(self.max_candidates)))
+                pairs_top = pairs[:topk]
+                scores_top = pair_scores[:topk]
+
+                # Depth-1 beam
+                beam1: List[Tuple[float, torch.Tensor]] = []
+                for (pi, pj), sc in zip(pairs_top, scores_top):
+                    for A1 in _single_edits(Ab, pi, pj):
+                        beam1.append((float(sc), A1))
+                beam1.sort(key=lambda x: x[0])
+                # Keep unique adjacency only
+                uniq1: List[Tuple[float, torch.Tensor]] = []
+                for sc, A1 in beam1:
+                    if not any(torch.equal(A1, U) for _, U in uniq1):
+                        uniq1.append((sc, A1))
+                    if len(uniq1) >= beam_size:
+                        break
+
+                # Add depth-1 candidates early (higher priority)
+                for _, A1 in uniq1:
+                    cand.append(A1)
+                    if len(cand) >= self.max_candidates:
+                        break
+
+                # Depth-2 beam (expand from best depth-1 states)
+                if len(cand) < self.max_candidates:
+                    beam2: List[Tuple[float, torch.Tensor]] = []
+                    for sc1, A1 in uniq1:
+                        for (pi, pj), sc2 in zip(pairs_top, scores_top):
+                            for A2 in _single_edits(A1, pi, pj):
+                                beam2.append((float(sc1 + sc2), A2))
+                    beam2.sort(key=lambda x: x[0])
+                    uniq2: List[Tuple[float, torch.Tensor]] = []
+                    for sc, A2 in beam2:
+                        if not any(torch.equal(A2, U) for _, U in uniq2):
+                            uniq2.append((sc, A2))
+                        if len(uniq2) >= beam_size:
+                            break
+
+                    for _, A2 in uniq2:
+                        cand.append(A2)
+                        if len(cand) >= self.max_candidates:
+                            break
+
+            # Standard single-edit candidates over all eligible pairs.
+            # NOTE: if two-step beam is enabled, many of the most relevant single-edits
+            # are already included. This loop adds coverage for remaining pairs.
             for (i, j) in pairs:
                 if len(cand) >= self.max_candidates:
                     break
-
-                a_ij = int(Ab[i, j].item())
-                a_ji = int(Ab[j, i].item())
-
-                if a_ij == 0 and a_ji == 0:
-                    # add either direction
-                    A1 = Ab.clone()
-                    A1[i, j] = 1
-                    A1[j, i] = 0
-                    if (not self.enforce_acyclic) or self._is_acyclic(A1, mb):
-                        cand.append(A1)
+                for A1 in _single_edits(Ab, i, j):
+                    cand.append(A1)
                     if len(cand) >= self.max_candidates:
                         break
-                    A2 = Ab.clone()
-                    A2[j, i] = 1
-                    A2[i, j] = 0
-                    if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
-                        cand.append(A2)
-                else:
-                    # delete both directions
-                    A1 = Ab.clone()
-                    A1[i, j] = 0
-                    A1[j, i] = 0
-                    if (not self.enforce_acyclic) or self._is_acyclic(A1, mb):
-                        cand.append(A1)
-                    if len(cand) >= self.max_candidates:
-                        break
-
-                    # flip if directed
-                    if a_ij == 1 and a_ji == 0:
-                        A2 = Ab.clone()
-                        A2[i, j] = 0
-                        A2[j, i] = 1
-                        if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
-                            cand.append(A2)
-                    elif a_ji == 1 and a_ij == 0:
-                        A2 = Ab.clone()
-                        A2[j, i] = 0
-                        A2[i, j] = 1
-                        if (not self.enforce_acyclic) or self._is_acyclic(A2, mb):
-                            cand.append(A2)
 
             cand = _unique_adjacency(cand)
 
@@ -509,6 +594,58 @@ class EBSTM(nn.Module):
             idx[b] = found
         return idx
 
+    @torch.no_grad()
+    def expected_ego_interaction_risk_proxy(
+        self,
+        candidate_A: torch.Tensor,   # [B,C,K,K]
+        probs: torch.Tensor,         # [B,C]
+        agent_feat: torch.Tensor,    # [B,K,Da]
+        agent_mask: torch.Tensor,    # [B,K]
+        *,
+        horizon_s: float = 3.0,
+        sigma_dist: float = 6.0,
+    ) -> torch.Tensor:
+        """Cheap proxy for incremental collision-risk contribution.
+
+        This is used for predictability-adaptive horizon truncation (paper: entropy + risk test).
+
+        We approximate "risk contribution" as expected *ego-involved interaction mass*
+        weighted by ego↔agent closest-approach distance under constant-velocity kinematics.
+
+        The proxy is intentionally lightweight:
+          1) compute ego↔agent closest-approach distance d_min within `horizon_s`
+          2) convert to weight w = exp(-d_min / sigma_dist)
+          3) for each candidate structure, count ego-involved edges (either direction)
+          4) take expectation under `probs`
+
+        Returns:
+          risk_proxy: [B]
+        """
+        if candidate_A.numel() == 0:
+            return torch.zeros((agent_feat.shape[0],), device=agent_feat.device, dtype=torch.float32)
+
+        B, C, K, _ = candidate_A.shape
+        if K <= 1:
+            return torch.zeros((B,), device=agent_feat.device, dtype=torch.float32)
+
+        # Closest approach distances under constant velocity.
+        dmin = self._pair_closest_approach_distance(agent_feat, float(horizon_s))  # [B,K,K]
+        d_ego = dmin[:, 0, :]  # [B,K]
+
+        # Distance weights (mask invalid agents)
+        w = torch.exp(-d_ego / max(1e-6, float(sigma_dist))).to(torch.float32)  # [B,K]
+        w = w * agent_mask.to(torch.float32)
+        w[:, 0] = 0.0
+
+        # Ego-involved edges (either direction)
+        a = (candidate_A > 0.5)
+        edge_any = a | a.transpose(-1, -2)  # [B,C,K,K]
+        edge_ego = edge_any[:, :, 0, :]     # [B,C,K]
+
+        risk_c = (edge_ego.to(torch.float32) * w.unsqueeze(1)).sum(dim=-1)  # [B,C]
+        risk = (risk_c * probs.to(torch.float32)).sum(dim=-1)               # [B]
+        return risk
+
     def rollout(
         self,
         A0: torch.Tensor,
@@ -521,12 +658,19 @@ class EBSTM(nn.Module):
         return_indices: bool = False,
         entropy_stop_threshold: Optional[float] = None,
         min_horizon_steps: int = 1,
+        # (Req-6) Combined truncation: entropy + risk contribution proxy
+        risk_stop_threshold: Optional[float] = None,
+        risk_horizon_s: float = 3.0,
+        risk_sigma_dist: float = 6.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Sample rollouts of interaction structures.
 
         Args:
           entropy_stop_threshold: if set, we stop evolving a batch item once the transition entropy exceeds it.
                                   Remaining steps repeat the last structure (predictability-adaptive horizon).
+          risk_stop_threshold: if set, we *only* stop when BOTH
+              (entropy > entropy_stop_threshold) AND (risk_proxy < risk_stop_threshold).
+            This aligns with the paper's "entropy + risk contribution" truncation.
         Returns:
           A_samples: [B, S, H, K, K]
           logp:      [B, S] (log prob under the EB-STM transitions)
@@ -553,13 +697,26 @@ class EBSTM(nn.Module):
 
                 out = self.forward(A_t, agent_feat, z_mean, z_logvar, agent_mask, oracle_next=None)
 
-                # entropy stop test (per batch)
+                # ------------------------------------------------------------------
+                # Predictability-adaptive horizon: entropy + (optional) risk proxy.
+                # ------------------------------------------------------------------
+                stop = torch.zeros((B,), device=A0.device, dtype=torch.bool)
                 if entropy_stop_threshold is not None and h + 1 >= int(min_horizon_steps):
                     p = out.probs.clamp_min(1e-12)
                     ent = -(p * torch.log(p)).sum(dim=-1)  # [B]
-                    stop = ent > float(entropy_stop_threshold)
-                else:
-                    stop = torch.zeros((B,), device=A0.device, dtype=torch.bool)
+                    ent_high = ent > float(entropy_stop_threshold)
+                    if risk_stop_threshold is None:
+                        stop = ent_high
+                    else:
+                        risk = self.expected_ego_interaction_risk_proxy(
+                            out.candidate_A,
+                            out.probs,
+                            agent_feat,
+                            agent_mask,
+                            horizon_s=float(risk_horizon_s),
+                            sigma_dist=float(risk_sigma_dist),
+                        )
+                        stop = ent_high & (risk < float(risk_stop_threshold))
 
                 # sample next for active & not stopped
                 cat = torch.distributions.Categorical(probs=out.probs)
@@ -583,6 +740,79 @@ class EBSTM(nn.Module):
 
         return A_samples, logp, idx_samples
 
+
+    @torch.no_grad()
+    def rollout_log_prob(
+        self,
+        A0: torch.Tensor,
+        rollouts: torch.Tensor,  # [B,S,H,K,K]
+        agent_feat: torch.Tensor,
+        z_mean: torch.Tensor,
+        z_logvar: torch.Tensor,
+        agent_mask: torch.Tensor,
+        *,
+        smooth_scale: float = 0.0,
+        phys_dist_threshold_m: float = 1e9,
+        phys_penalty_scale: float = 0.0,
+        missing_logp: float = -30.0,
+    ) -> torch.Tensor:
+        """Compute log-probabilities of provided rollouts under the EB-STM transitions.
+
+        This is useful for importance sampling / mixed-support PCI.
+        If a step's next structure is not in the candidate set, we assign `missing_logp`.
+
+        Args:
+          A0:       [B,K,K] initial adjacency
+          rollouts: [B,S,H,K,K] adjacency sequences where rollouts[:,:,h] is A_{t+h+1}
+        Returns:
+          logp:     [B,S]
+        """
+        if rollouts.numel() == 0:
+            B = A0.shape[0]
+            S = rollouts.shape[1]
+            return torch.zeros((B, S), device=A0.device, dtype=torch.float32)
+
+        B, S, H, K, _ = rollouts.shape
+        logp = torch.zeros((B, S), device=A0.device, dtype=torch.float32)
+
+        A_prev = A0.unsqueeze(1).expand(B, S, K, K)
+        for h in range(H):
+            A_next = rollouts[:, :, h]
+
+            # Flatten BS for a single EB-STM forward.
+            A_prev_f = A_prev.reshape(B * S, K, K)
+            A_next_f = A_next.reshape(B * S, K, K)
+
+            feat_f = agent_feat.unsqueeze(1).expand(B, S, K, agent_feat.shape[-1]).reshape(B * S, K, -1)
+            zm_f = z_mean.unsqueeze(1).expand(B, S, K, z_mean.shape[-1]).reshape(B * S, K, -1)
+            zv_f = z_logvar.unsqueeze(1).expand(B, S, K, z_logvar.shape[-1]).reshape(B * S, K, -1)
+            mask_f = agent_mask.unsqueeze(1).expand(B, S, K).reshape(B * S, K)
+
+            out = self.forward(
+                A_prev_f,
+                feat_f,
+                zm_f,
+                zv_f,
+                mask_f,
+                oracle_next=None,
+                smooth_scale=float(smooth_scale),
+                phys_dist_threshold_m=float(phys_dist_threshold_m),
+                phys_penalty_scale=float(phys_penalty_scale),
+            )
+
+            cand = out.candidate_A  # [BS,C,K,K]
+            eq = (cand == A_next_f.unsqueeze(1)).all(dim=-1).all(dim=-1) & out.candidate_mask
+            has = eq.any(dim=-1)
+            idx_match = torch.argmax(eq.to(torch.int64), dim=-1)
+
+            p_sel = out.probs[torch.arange(B * S, device=A0.device), idx_match].clamp_min(1e-12)
+            lp_step = torch.where(has, torch.log(p_sel), torch.full_like(p_sel, float(missing_logp)))
+            logp = logp + lp_step.view(B, S)
+
+            A_prev = A_next
+
+        return logp
+
     @torch.no_grad()
     def beam_rollout(
         self,
@@ -596,11 +826,17 @@ class EBSTM(nn.Module):
         beam_size: int = 8,
         entropy_stop_threshold: Optional[float] = None,
         min_horizon_steps: int = 1,
+        # (Req-6) Combined truncation: entropy + risk contribution proxy
+        risk_stop_threshold: Optional[float] = None,
+        risk_horizon_s: float = 3.0,
+        risk_sigma_dist: float = 6.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Beam rollout over structures (top-K sequences).
 
         Args:
           entropy_stop_threshold: if set, stop expanding a batch item once transition entropy exceeds it.
+          risk_stop_threshold: if set, we *only* stop when BOTH
+              (entropy > entropy_stop_threshold) AND (risk_proxy < risk_stop_threshold)
         Returns:
           A_beams:  [B, beam, H, K, K] (H == max_horizon_steps; if stopped early, last structure is repeated)
           logp:     [B, beam]
@@ -642,7 +878,19 @@ class EBSTM(nn.Module):
                 # stop criterion based on best beam (beam 0) entropy
                 stop_b = ent[:, 0] > float(entropy_stop_threshold)
                 if h + 1 >= int(min_horizon_steps):
-                    active = active & (~stop_b)
+                    if risk_stop_threshold is None:
+                        active = active & (~stop_b)
+                    else:
+                        risk_flat = self.expected_ego_interaction_risk_proxy(
+                            out.candidate_A,
+                            out.probs,
+                            feat_flat,
+                            mask_flat,
+                            horizon_s=float(risk_horizon_s),
+                            sigma_dist=float(risk_sigma_dist),
+                        )  # [B*beam]
+                        risk = risk_flat.view(B, beam)[:, 0]
+                        active = active & (~(stop_b & (risk < float(risk_stop_threshold))))
 
             # Expand beams: for each existing beam, take top candidates
             topk = min(beam, C)
