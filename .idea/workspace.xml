@@ -5,23 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="0d212035-263f-4e6e-b692-06cefc0ec579" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/configs/train/stage2_eb.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/configs/train/stage2_eb.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/configs/train/stage3_joint.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/configs/train/stage3_joint.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/data/extractor.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/data/extractor.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/models/eb_stm.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/models/eb_stm.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/models/motion_primitives.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/models/motion_primitives.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/models/preference_completion.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/models/preference_completion.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/models/prefworld_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/models/prefworld_model.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/models/template_encoder.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/models/template_encoder.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/prefworld/nuplan_integration/prefworld_planner.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/nuplan_integration/prefworld_planner.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/planning/pci.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/planning/pci.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/prefworld/planning/planner.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/planning/planner.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/scripts/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/scripts/train.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/scripts/train_stage1_pc.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/scripts/train_stage1_pc.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/scripts/train_stage2_ebstm.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/scripts/train_stage2_ebstm.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/scripts/train_stage3_joint.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/scripts/train_stage3_joint.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prefworld/training/trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/training/trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/prefworld/scripts/prepare_dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/prefworld/scripts/prepare_dataset.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

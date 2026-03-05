@@ -135,8 +135,17 @@ class PrefWorldNuPlanPlanner(AbstractPlanner):
 
         # Build a list of StateSE2 with monotonically increasing TimePoints.
         dt = float(self.planner_cfg.dt)
+
+        # Prefer the timestamp from the ego state vector used during feature extraction.
         start_time_us = 0
-        if hasattr(current_input, "history") and hasattr(current_input.history, "current_state"):
+        try:
+            if "ego_time_us" in batch:
+                start_time_us = int(batch["ego_time_us"][0].detach().cpu().item())
+        except Exception:
+            start_time_us = 0
+
+        # Fallback: attempt to read from nuPlan's history/current_state
+        if start_time_us == 0 and hasattr(current_input, "history") and hasattr(current_input.history, "current_state"):
             # nuPlan stores timestamps in microseconds on EgoState
             try:
                 start_time_us = int(current_input.history.current_state.time_point.time_us)
@@ -164,7 +173,15 @@ class PrefWorldNuPlanPlanner(AbstractPlanner):
         cfg = self.adapter_cfg
 
         # Import PrefWorld extractor helpers lazily (keeps module import-safe).
-        from prefworld.data.extractor import ExtractionConfig, _agent_pose_vel_size, _get_track_token, _traffic_light_dict, _extract_map_polylines, _compute_structure_and_confidence_from_futures
+        from prefworld.data.extractor import (
+            ExtractionConfig,
+            _agent_pose_vel_size,
+            _ego_state_to_vector,
+            _get_track_token,
+            _traffic_light_dict,
+            _extract_map_polylines,
+            _compute_structure_and_confidence_from_futures,
+        )
         from prefworld.utils.geometry import global_to_local_pose, global_to_local_xy
 
         # ------------------------------------------------------------------
@@ -183,9 +200,11 @@ class PrefWorldNuPlanPlanner(AbstractPlanner):
         ego_states = ego_states[-Tp:]
 
         # current ego pose (global)
-        ego_v = EgoStateVector.from_ego_state(ego_states[-1])
-        ego_xy = np.array([float(ego_v.x), float(ego_v.y)], dtype=np.float32)
-        ego_yaw = float(ego_v.yaw)
+        # Use the same conversion helper as the offline extractor for consistency.
+        ego_vec = _ego_state_to_vector(ego_states[-1])
+        ego_time_us = int(ego_vec[0])
+        ego_xy = np.array([float(ego_vec[1]), float(ego_vec[2])], dtype=np.float32)
+        ego_yaw = float(ego_vec[3])
 
         # ------------------------------------------------------------------
         # Observations (tracked objects) history
@@ -289,12 +308,12 @@ class PrefWorldNuPlanPlanner(AbstractPlanner):
         ego_hist_local = np.zeros((Tp, 3), dtype=np.float32)
         ego_dyn_local = np.zeros((Tp, 4), dtype=np.float32)
         for k, st in enumerate(ego_states):
-            ev = EgoStateVector.from_ego_state(st)
-            pose_g = np.array([float(ev.x), float(ev.y), float(ev.yaw)], dtype=np.float32)
+            ev = _ego_state_to_vector(st)
+            pose_g = np.array([float(ev[1]), float(ev[2]), float(ev[3])], dtype=np.float32)
             ego_hist_local[k] = global_to_local_pose(pose_g[None, :], ego_xy, ego_yaw)[0]
 
-            vxg, vyg = float(ev.vx), float(ev.vy)
-            axg, ayg = float(ev.ax), float(ev.ay)
+            vxg, vyg = float(ev[4]), float(ev[5])
+            axg, ayg = float(ev[6]), float(ev[7])
             vel_local = global_to_local_xy(np.array([[vxg, vyg]], dtype=np.float32), np.zeros(2, dtype=np.float32), ego_yaw)[0]
             acc_local = global_to_local_xy(np.array([[axg, ayg]], dtype=np.float32), np.zeros(2, dtype=np.float32), ego_yaw)[0]
             ego_dyn_local[k] = np.array([vel_local[0], vel_local[1], acc_local[0], acc_local[1]], dtype=np.float32)
@@ -411,6 +430,8 @@ class PrefWorldNuPlanPlanner(AbstractPlanner):
             "structure_conf_t": np.array([float(structure_conf_t)], dtype=np.float32),
             # local->global conversion
             "ego_global_pose": np.array([[float(ego_xy[0]), float(ego_xy[1]), float(ego_yaw)]], dtype=np.float32),
+            # absolute time (microseconds) of the current ego state
+            "ego_time_us": np.array([ego_time_us], dtype=np.int64),
         }
 
         return {k: torch.as_tensor(v, device=self.device) for k, v in batch_np.items()}

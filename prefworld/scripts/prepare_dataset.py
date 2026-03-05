@@ -42,17 +42,35 @@ def main() -> None:
     out_dir = cache_dir / split / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    db_files = []
-    for folder in ['train_boston', 'train_pittsburgh', 'train_singapore']:
-        folder_path = Path(f'/coolas-shared/yusz/dataset/nuplan/data/cache/{folder}')
-        db_files.extend(list(folder_path.glob('*.db')))
+    # ------------------------------------------------------------------
+    # Resolve nuPlan DB files from config
+    #
+    # We support both of the following (see configs/dataset/nuplan_db.yaml):
+    #   - dataset.<split>:  e.g. dataset.train / dataset.val as list/dir/glob
+    #   - dataset.db_files: a single list/dir/glob used for the active split
+    #
+    # If neither is provided, NuPlanDataConfig/build_scenarios will attempt
+    # to infer db files by scanning under dataset.data_root.
+    # ------------------------------------------------------------------
+    db_files_cfg = None
+    try:
+        if split in cfg.dataset:
+            db_files_cfg = cfg.dataset.get(split)
+    except Exception:
+        db_files_cfg = None
+
+    # Fallback to dataset.db_files
+    if db_files_cfg is None or (isinstance(db_files_cfg, (list, tuple)) and len(db_files_cfg) == 0) or (
+        isinstance(db_files_cfg, str) and len(db_files_cfg.strip()) == 0
+    ):
+        db_files_cfg = cfg.dataset.get("db_files", None)
 
     # Build scenarios
     data_cfg = NuPlanDataConfig(
         data_root=str(cfg.dataset.data_root),
         map_root=str(cfg.dataset.map_root),
         map_version=str(cfg.dataset.map_version),
-        db_files=db_files,
+        db_files=db_files_cfg,
         sensor_root=cfg.dataset.get("sensor_root", None),
         include_cameras=False,
         max_workers=int(cfg.dataset.max_workers),
@@ -89,12 +107,7 @@ def main() -> None:
 
     total_written = 0
 
-    existing_items = read_index_jsonl(index_path) if index_path.exists() else []
-    total_processed = len(existing_items)
-    # 初始化进度条，跳过已处理部分
-    scenarios = build_scenarios(data_cfg)
-    total_scenarios = len(scenarios)
-    progress_bar = tqdm(scenarios, desc=f"Extracting {split}", initial=total_processed, total=total_scenarios)
+    progress_bar = tqdm(scenarios, desc=f"Extracting {split}")
 
     for sc in progress_bar:
         token = _scenario_token(sc)
@@ -156,7 +169,7 @@ def main() -> None:
             processed.add(key)
 
             total_written += 1
-            progress_bar.update(1)
+            progress_bar.set_postfix(written=total_written, indexed=len(index_items))
             if max_total is not None and total_written >= int(max_total):
                 break
         if max_total is not None and total_written >= int(max_total):

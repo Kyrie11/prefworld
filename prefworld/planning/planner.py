@@ -60,6 +60,10 @@ class PlannerConfig:
     pci_num_rollouts_baseline: int = 16
     pci_use_beam: bool = False
     pci_beam_size: int = 16
+    # Whether to weight shared rollout support by the model rollout probabilities.
+    # Setting this to False uses a uniform distribution over the sampled/beam rollouts,
+    # which is often more robust when logp estimates are noisy.
+    pci_use_model_probs: bool = False
     pci_fallback_k: int = 2
 
     # Risk aggregation
@@ -291,7 +295,7 @@ def plan_with_structures(
                 num_rollouts=int(cfg.pci_num_structure_samples),
                 use_beam_rollout=bool(cfg.pci_use_beam),
                 beam_size=int(cfg.pci_beam_size),
-                use_model_probs=True,
+                use_model_probs=bool(getattr(cfg, "pci_use_model_probs", False)),
                 cvar_alpha=float(cfg.cvar_alpha),
                 smooth_eps=float(cfg.pci_smooth_eps),
                 dt=float(structure_dt),
