@@ -308,10 +308,10 @@ def main() -> None:
                 q_nll=float(out.losses.get("loss_pc_query_nll", torch.tensor(0.0)).item()),
                 kl=float(out.losses.get("loss_pc_kl_ctx_prior", torch.tensor(0.0)).item()),
                 con=float(out.losses.get("loss_pc_contrastive", torch.tensor(0.0)).item()),
-                H=float(H_mean),
-                H50=float(H_p50),
-                zstd=float(zstd_mean),
-                z50=float(zstd_p50),
+                # H=float(H_mean),
+                # H50=float(H_p50),
+                # zstd=float(zstd_mean),
+                # z50=float(zstd_p50),
                 lam_mu=lam_mu, lam_pr=lam_prior, lam_ov=lam_ov, lam_mod=lam_mod
             )
 
