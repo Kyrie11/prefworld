@@ -322,15 +322,13 @@ def main() -> None:
             )
 
             if logger is not None:
-                logger.log({
-                    "train/loss": loss.item(),
-                    "train/H": H_mean,
-                    "train/zstd": zstd_mean,
-                    "train/lam_mu": lam_mu,
-                    "train/lam_pr": lam_prior,
-                    "train/lam_ov": lam_ov,
-                    "train/lam_mod": lam_mod,
-                }, step=global_step)
+                logger.add_scalar("train/loss", loss.item(), global_step)
+                logger.add_scalar("train/H", H_mean, global_step)
+                logger.add_scalar("train/zstd", zstd_mean, global_step)
+                logger.add_scalar("train/lam_mu", lam_mu, global_step)
+                logger.add_scalar("train/lam_pr", lam_prior, global_step)
+                logger.add_scalar("train/lam_ov", lam_ov, global_step)
+                logger.add_scalar("train/lam_mod", lam_mod, global_step)
 
             epoch_loss_sum += float(loss.item())
             epoch_steps += 1
