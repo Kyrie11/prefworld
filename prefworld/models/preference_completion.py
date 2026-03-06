@@ -229,9 +229,10 @@ class PreferenceCompletion(nn.Module):
         tau_mean = (tau * m.unsqueeze(-1)).sum(dim=2) / denom
         ctx_mean = (ctx * m.unsqueeze(-1)).sum(dim=2) / denom
         h = torch.cat([tau_mean, ctx_mean], dim=-1)
+        h = F.layer_norm(h, (h.shape[-1],))  # 新增：对 prior_net 输入归一化
         out = self.prior_net(h)
         mean = out[..., : self.z_dim]
-        logvar = out[..., self.z_dim :].clamp(min=-10.0, max=10.0)
+        logvar = out[..., self.z_dim :].clamp(min=-10.0, max=2.0)
         return DiagGaussian(mean=mean, logvar=logvar)
 
     def _posterior_from_mask(

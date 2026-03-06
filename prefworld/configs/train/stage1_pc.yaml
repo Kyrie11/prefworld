@@ -39,12 +39,12 @@ train:
   pc_cross_template_warmup_epochs: 1
 
   # --- Preference completion loss weights (Eq. 18) ---
-  lambda_distill_mu: 0.0
-  lambda_distill_cov: 0.0
-  lambda_prior: 0.0
-  lambda_con: 0.0
-  lambda_overlap: 0.0
-  lambda_mod: 0.0
+  lambda_distill_mu: 1.0
+  lambda_distill_cov: 0.05
+  lambda_prior: 0.1
+  lambda_con: 0.05
+  lambda_overlap: 1.0e-3
+  lambda_mod: 1.0e-3
 
   n_z_samples: 1
   free_bits: 0.0
