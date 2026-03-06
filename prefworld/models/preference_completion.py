@@ -476,7 +476,11 @@ class PreferenceCompletion(nn.Module):
         # ---- Distillation: mean + covariance ----
         mu_ctx = post_ctx.q.mean
         mu_full = post_full.q.mean.detach()
-        loss_distill_mu = ((mu_ctx - mu_full) ** 2).sum(dim=-1)  # [B,N]
+        diff = mu_ctx - mu_full
+        diff = diff.clamp(-20.0, 20.0)  # 或者用 smooth_l1_loss
+        loss_distill_mu = (diff * diff).sum(-1)
+        # 或：
+        loss_distill_mu = F.smooth_l1_loss(mu_ctx, mu_full, reduction="none").sum(-1)  # [B,N]
 
         # KL(N(0, Σ_full)||N(0, Σ_ctx))
         loss_distill_cov = self._kl_zero_mean_diag(post_full.q.logvar.detach(), post_ctx.q.logvar)  # [B,N]
