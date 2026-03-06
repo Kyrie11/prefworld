@@ -89,7 +89,8 @@ class LowRankTemplateModulation(nn.Module):
         bz = bz.unsqueeze(2).expand(B, N, T, self.rank)  # [B,N,T,r]
 
         # tau -> A matrices
-        A = self.A(tau_e).view(B, N, T, self.z_dim, self.rank)  # [B,N,T,Dz,r]
+        tau_n = F.layer_norm(tau_e, (tau_e.shape[-1],))
+        A = self.A(tau_n).view(B, N, T, self.z_dim, self.rank)  # [B,N,T,Dz,r]
 
         delta = torch.einsum("bntdr,bntr->bntd", A, bz)
         z_base = z.unsqueeze(2).expand(B, N, T, self.z_dim)
@@ -458,7 +459,7 @@ class MotionPrimitiveDecoder(nn.Module):
         feasible_action_penalty: float = 5.0,
         feasible_action_soft_penalty_train: bool = True,
         feasible_action_hard_mask_eval: bool = True,
-        emission_type: str = "gaussian",
+        emission_type: str = "frenet",
         dt: float = 0.1,
     ) -> None:
         super().__init__()

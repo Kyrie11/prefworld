@@ -318,7 +318,7 @@ def main() -> None:
                 ov=float(out.losses.get("loss_pc_overlap", torch.tensor(0.0)).item()),
                 mod=float(out.losses.get("loss_pc_mod", torch.tensor(0.0)).item()),
                 lmu=float(lam_mu),
-                lov=float(lam_ov),
+                lam_mod=float(lam_mod)
             )
 
             if logger is not None:

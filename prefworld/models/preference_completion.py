@@ -100,9 +100,12 @@ class EvidenceEncoder(nn.Module):
         ctx: torch.Tensor,       # [B,N,T,Dc]
         mask: torch.Tensor,      # [B,N,T]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = self.net(torch.cat([x, tau, ctx], dim=-1))
+        inp = torch.cat([x, tau, ctx], dim=-1)
+        inp = F.layer_norm(inp, (inp.shape[-1],))
+        h = self.net(inp)
         delta_eta = self.to_eta(h)                              # [B,N,T,Dz]
         delta_L = F.softplus(self.to_L(h))                      # [B,N,T,Dz] >= 0
+        delta_L = delta_L.clamp_max(10.0)
         alpha = torch.sigmoid(self.to_alpha(h)).squeeze(-1)     # [B,N,T]
 
         m = mask > 0.5
@@ -254,7 +257,12 @@ class PreferenceCompletion(nn.Module):
 
         pooled_eta = nat0.eta + (a * delta_eta * m.unsqueeze(-1).to(dtype=delta_eta.dtype)).sum(dim=2)
         pooled_L = nat0.Lambda + (a * delta_L * m.unsqueeze(-1).to(dtype=delta_L.dtype)).sum(dim=2)
-        nat = NaturalDiagGaussian(eta=pooled_eta, Lambda=pooled_L.clamp_min(1e-6))
+        L_MIN = 1e-6
+        L_MAX = 50.0  # 先用 20~100 试，50 通常很稳
+        nat = NaturalDiagGaussian(
+            eta=pooled_eta.clamp(-1e3, 1e3),  # 可选：也给 eta 一个软上界
+            Lambda=pooled_L.clamp(L_MIN, L_MAX),
+        )
         q = nat.to_moment()
         return PreferencePosterior(q=q, nat=nat, alpha=alpha)
 
@@ -463,6 +471,7 @@ class PreferenceCompletion(nn.Module):
             mod_s.append(mod_one)
         loss_query_nll = torch.stack(nll_s, dim=0).mean(dim=0)  # [B,N]
         loss_modulation = torch.stack(mod_s, dim=0).mean(dim=0)  # [B,N]
+
 
         # ---- Distillation: mean + covariance ----
         mu_ctx = post_ctx.q.mean
