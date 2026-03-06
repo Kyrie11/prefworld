@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict, Tuple
+from torch.utils.tensorboard import SummaryWriter
+import os
+import datetime
 
 import torch
 from torch.utils.data import DataLoader
@@ -97,6 +100,10 @@ def make_cross_template_split(
 
 
 def main() -> None:
+    log_dir = os.path.join("pc_runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    # 初始化 logger
+    logger = SummaryWriter(log_dir=log_dir)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to stage1_pc.yaml")
     args = parser.parse_args()
@@ -305,15 +312,25 @@ def main() -> None:
 
             pbar.set_postfix(
                 loss=float(loss.item()),
-                q_nll=float(out.losses.get("loss_pc_query_nll", torch.tensor(0.0)).item()),
+                q=float(out.losses.get("loss_pc_query_nll", torch.tensor(0.0)).item()),
                 kl=float(out.losses.get("loss_pc_kl_ctx_prior", torch.tensor(0.0)).item()),
-                con=float(out.losses.get("loss_pc_contrastive", torch.tensor(0.0)).item()),
-                # H=float(H_mean),
-                # H50=float(H_p50),
-                # zstd=float(zstd_mean),
-                # z50=float(zstd_p50),
-                lam_mu=lam_mu, lam_pr=lam_prior, lam_ov=lam_ov, lam_mod=lam_mod
+                dmu=float(out.losses.get("loss_pc_distill_mu", torch.tensor(0.0)).item()),
+                ov=float(out.losses.get("loss_pc_overlap", torch.tensor(0.0)).item()),
+                mod=float(out.losses.get("loss_pc_mod", torch.tensor(0.0)).item()),
+                lmu=float(lam_mu),
+                lov=float(lam_ov),
             )
+
+            if logger is not None:
+                logger.log({
+                    "train/loss": loss.item(),
+                    "train/H": H_mean,
+                    "train/zstd": zstd_mean,
+                    "train/lam_mu": lam_mu,
+                    "train/lam_pr": lam_prior,
+                    "train/lam_ov": lam_ov,
+                    "train/lam_mod": lam_mod,
+                }, step=global_step)
 
             epoch_loss_sum += float(loss.item())
             epoch_steps += 1
