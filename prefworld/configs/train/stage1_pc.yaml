@@ -38,13 +38,21 @@ train:
   pc_cross_template_topk_frac: 0.5     # fraction of queries chosen from most-novel candidates
   pc_cross_template_warmup_epochs: 1
 
+  # schedule steps (按 step 计数，不是 epoch)
+  freeze_steps: 2000      # Phase0: 冻结 template+prior_net，所有lambda=0
+  ramp1_steps: 8000       # Phase1: distill/prior 线性升权到最终值
+  ramp2_steps: 8000       # Phase2: con/overlap/mod 线性升权到最终值
+
   # --- Preference completion loss weights (Eq. 18) ---
-  lambda_distill_mu: 0
-  lambda_distill_cov: 0
-  lambda_prior: 0
-  lambda_con: 0
-  lambda_overlap: 0
-  lambda_mod: 0
+  # "final" lambda targets (脚本会从0升到这些)
+  lambda_distill_mu: 0.1
+  lambda_distill_cov: 0.02
+  lambda_prior: 0.01
+  lambda_con: 0.01
+
+  # 这两个是最容易炸的：先用非常小的最终值
+  lambda_overlap: 1.0e-6
+  lambda_mod: 1.0e-5
 
   n_z_samples: 1
   free_bits: 0.0

@@ -149,6 +149,33 @@ def main() -> None:
 
     tcfg = cfg["train"]
 
+    # ------------------------------
+    # Lambda schedules + freezing
+    # ------------------------------
+    freeze_steps = int(tcfg.get("freeze_steps", 2000))
+    ramp1_steps = int(tcfg.get("ramp1_steps", 8000))
+    ramp2_steps = int(tcfg.get("ramp2_steps", 8000))
+
+    # final targets (the "end" values you want to reach)
+    lam_mu_final = float(tcfg.get("lambda_distill_mu", 0.1))
+    lam_cov_final = float(tcfg.get("lambda_distill_cov", 0.02))
+    lam_prior_final = float(tcfg.get("lambda_prior", 0.01))
+    lam_con_final = float(tcfg.get("lambda_con", 0.01))
+    lam_ov_final = float(tcfg.get("lambda_overlap", 1e-6))
+    lam_mod_final = float(tcfg.get("lambda_mod", 1e-5))
+
+    def _ramp(step: int, start: int, duration: int, final: float) -> float:
+        if step < start:
+            return 0.0
+        if duration <= 0:
+            return float(final)
+        t = (step - start) / float(duration)
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return float(final) * float(t)
+
+    global_step = 0
+
+
     for epoch in range(int(tcfg.get("max_epochs", 20))):
         model.train()
         pbar = tqdm(loader, desc=f"Stage1-PC epoch {epoch}")
@@ -160,6 +187,19 @@ def main() -> None:
             batch = _move_to_device(batch, device)
             # 在 move_to_device 之前检查（CPU 更快定位）
 
+            # Freeze / unfreeze template + context-prior net
+            if global_step < freeze_steps:
+                for p in model.template.parameters():
+                    p.requires_grad_(False)
+                if getattr(model.pc, "prior_net", None) is not None:
+                    for p in model.pc.prior_net.parameters():
+                        p.requires_grad_(False)
+            else:
+                for p in model.template.parameters():
+                    p.requires_grad_(True)
+                if getattr(model.pc, "prior_net", None) is not None:
+                    for p in model.pc.prior_net.parameters():
+                        p.requires_grad_(True)
 
             # Encode templates once so we can build cross-template splits.
             with torch.set_grad_enabled(True):
@@ -193,6 +233,18 @@ def main() -> None:
                     topk_frac=float(tcfg.get("pc_cross_template_topk_frac", 0.5)),
                 )
 
+            # Phase boundaries
+            phase1_start = freeze_steps
+            phase2_start = freeze_steps + ramp1_steps
+
+            lam_mu = _ramp(global_step, phase1_start, ramp1_steps, lam_mu_final)
+            lam_cov = _ramp(global_step, phase1_start, ramp1_steps, lam_cov_final)
+            lam_prior = _ramp(global_step, phase1_start, ramp1_steps, lam_prior_final)
+
+            lam_con = _ramp(global_step, phase2_start, ramp2_steps, lam_con_final)
+            lam_ov = _ramp(global_step, phase2_start, ramp2_steps, lam_ov_final)
+            lam_mod = _ramp(global_step, phase2_start, ramp2_steps, lam_mod_final)
+
             out = model(
                 batch,
                 run_pc=True,
@@ -200,12 +252,12 @@ def main() -> None:
                 pc_query_ratio=float(tcfg.get("pc_query_ratio", 0.3)),
                 pc_ctx_mask_override=ctx_mask,
                 pc_query_mask_override=query_mask,
-                lambda_distill_mu=float(tcfg.get("lambda_distill_mu", 1.0)),
-                lambda_distill_cov=float(tcfg.get("lambda_distill_cov", 0.05)),
-                lambda_prior=float(tcfg.get("lambda_prior", 0.1)),
-                lambda_con=float(tcfg.get("lambda_con", 0.05)),
-                lambda_overlap=float(tcfg.get("lambda_overlap", 1e-3)),
-                lambda_mod=float(tcfg.get("lambda_mod", 1e-3)),
+                lambda_distill_mu=lam_mu,
+                lambda_distill_cov=lam_cov,
+                lambda_prior=lam_prior,
+                lambda_con=lam_con,
+                lambda_overlap=lam_ov,
+                lambda_mod=lam_mod,
                 n_z_samples=int(tcfg.get("n_z_samples", 1)),
                 free_bits=float(tcfg.get("free_bits", 0.0)),
             )
@@ -260,14 +312,12 @@ def main() -> None:
                 H50=float(H_p50),
                 zstd=float(zstd_mean),
                 z50=float(zstd_p50),
-                over=float(out.losses.get("loss_pc_overlap", torch.tensor(0.0)).item()),
-                mod = float(out.losses.get("loss_pc_mod", torch.tensor(0.0)).item()),
-                dmu = float(out.losses.get("loss_pc_distill_mu", torch.tensor(0.0)).item()),
-                dcov = float(out.losses.get("loss_pc_distill_cov", torch.tensor(0.0)).item()),
+                lam_mu=lam_mu, lam_pr=lam_prior, lam_ov=lam_ov, lam_mod=lam_mod
             )
 
             epoch_loss_sum += float(loss.item())
             epoch_steps += 1
+            global_step += 1
 
         # checkpoint
         save_checkpoint(str(ckpt_dir / "last.pt"), model, optimizer, epoch, -best_loss)
