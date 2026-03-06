@@ -458,7 +458,7 @@ class MotionPrimitiveDecoder(nn.Module):
         feasible_action_penalty: float = 5.0,
         feasible_action_soft_penalty_train: bool = True,
         feasible_action_hard_mask_eval: bool = True,
-        emission_type: str = "frenet",
+        emission_type: str = "gaussian",
         dt: float = 0.1,
     ) -> None:
         super().__init__()
