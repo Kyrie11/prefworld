@@ -452,6 +452,11 @@ class PreferenceCompletion(nn.Module):
             nll = -(log_mix_q).sum(dim=-1) / denom
             # modulation reg proxy (per agent)
             mod = (dec.z_mod_delta.pow(2).sum(dim=-1) * valid_mask.to(dtype=torch.float32)).sum(dim=-1) / (valid_mask.to(dtype=torch.float32).sum(dim=-1) + 1e-6)
+
+            print("DBG logp_x_given_m:", dec.logp_x_given_m.min().item(), dec.logp_x_given_m.max().item())
+            print("DBG logits:", dec.maneuver_logits.min().item(), dec.maneuver_logits.max().item())
+            print("DBG log_mix:", log_mix.min().item(), log_mix.max().item())
+
             return nll, mod
 
         nll_s = []
