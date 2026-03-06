@@ -530,6 +530,12 @@ class PreferenceCompletion(nn.Module):
                 feasible_actions_last=fa_last,
             ).detach()
 
+        print("DBG tau", tau.abs().max().item(), "ctx", ctx.abs().max().item(), "x", x.abs().max().item())
+        print("DBG delta_L max", delta_L.max().item(), "delta_eta max", delta_eta.abs().max().item(), "alpha max",
+              alpha.max().item())
+        print("DBG mu_ctx max", post_ctx.q.mean.abs().max().item(), "logvar_ctx range", post_ctx.q.logvar.min().item(),
+              post_ctx.q.logvar.max().item())
+
         return PreferenceCompletionOutput(
             post_full=post_full,
             post_ctx=post_ctx,

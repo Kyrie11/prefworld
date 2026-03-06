@@ -260,6 +260,10 @@ def main() -> None:
                 H50=float(H_p50),
                 zstd=float(zstd_mean),
                 z50=float(zstd_p50),
+                over=float(out.losses.get("loss_pc_overlap", torch.tensor(0.0)).item()),
+                mod = float(out.losses.get("loss_pc_mod", torch.tensor(0.0)).item()),
+                dmu = float(out.losses.get("loss_pc_distill_mu", torch.tensor(0.0)).item()),
+                dcov = float(out.losses.get("loss_pc_distill_cov", torch.tensor(0.0)).item()),
             )
 
             epoch_loss_sum += float(loss.item())
