@@ -26,7 +26,7 @@ optim:
   weight_decay: 1.0e-4
 
 train:
-  output_dir: outputs_stage1_pc
+  output_dir: /home/ysz/code/prefworld/output/stage1_pc
   batch_size: 16
   num_workers: 4
   max_epochs: 20
