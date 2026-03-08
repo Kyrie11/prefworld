@@ -60,14 +60,22 @@ def main() -> None:
             if torch.is_tensor(v):
                 batch[k] = v.to(device)
 
-        template, ego_valid, agents_valid = model.encode_templates(batch)
-        fa = template.feasible_actions  # [B, 1+N, T, M]
-        if fa is None:
-            raise RuntimeError("TemplateEncoder did not return feasible_actions.")
+        template, _, _ = model.encode_templates(batch)
+        fa = template.feasible_actions
+        fam = template.action_family
+        if fa is None or fam is None:
+            raise RuntimeError("TemplateEncoder did not return structured feasible_actions/action_family.")
 
-        # last token
-        fa_last_agents = fa[:, 1:, -1, :]  # [B, N, M]
-        fa_last_ego = fa[:, 0:1, -1, :]    # [B, 1, M]
+        # last token; collapse structured action slots to legacy maneuver families for offline checks.
+        fa_last_agents = torch.zeros((fa.shape[0], fa.shape[1] - 1, model.num_maneuvers), device=device, dtype=torch.bool)
+        fa_last_ego = torch.zeros((fa.shape[0], 1, model.num_maneuvers), device=device, dtype=torch.bool)
+        fa_slots_agents = fa[:, 1:, -1, :]
+        fam_slots_agents = fam[:, 1:, -1, :]
+        fa_slots_ego = fa[:, 0:1, -1, :]
+        fam_slots_ego = fam[:, 0:1, -1, :]
+        for m in range(model.num_maneuvers):
+            fa_last_agents[..., m] = (fa_slots_agents & (fam_slots_agents == m)).any(dim=-1)
+            fa_last_ego[..., m] = (fa_slots_ego & (fam_slots_ego == m)).any(dim=-1)
 
         # validity
         valid_agents = (batch["agents_hist_mask"][:, :, -1] > 0.5)

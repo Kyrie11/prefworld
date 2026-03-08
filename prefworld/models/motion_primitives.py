@@ -8,438 +8,517 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prefworld.data.labels import NUM_MANEUVERS
+from prefworld.data.labels import (
+    LonConstraint,
+    Maneuver,
+    NUM_MANEUVERS,
+    NUM_LON_CONSTRAINTS,
+    NUM_PATH_TYPES,
+    PathType,
+    path_constraint_to_maneuver,
+)
 
 
 @dataclass
 class PrimitiveDecodeOutput:
-    """Per-token primitive decode outputs."""
+    """Per-token primitive decode outputs.
 
-    maneuver_logits: torch.Tensor  # [B,N,T,M]
-    logp_x_given_m: torch.Tensor   # [B,N,T,M]
+    Notes
+    -----
+    * ``maneuver_logits`` is kept for backward compatibility, but it contains **logits
+      over structured action slots** a=(path branch, longitudinal constraint source).
+    * ``logp_x_given_m`` is the motion/kinematics likelihood term p_n(X|m,xi,\tau^{det})
+      marginalized by a lightweight MAP approximation. Importantly, it is **independent
+      of z** (paper Sec.\ref{sec:primitive_likelihood}).
+    * ``z_mod``/``z_mod_delta`` are kept to avoid touching downstream code. In the paper
+      design preferences are episode-stationary (no template-conditioned modulation), so
+      we set z_mod=z broadcast over time and z_mod_delta=0.
+    """
+
+    maneuver_logits: torch.Tensor  # [B,N,T,A] structured action-slot logits (policy π)
+    logp_x_given_m: torch.Tensor   # [B,N,T,A] motion token log-likelihood per slot
+
+    # kept for compatibility with older losses / logging
     z_mod: torch.Tensor            # [B,N,T,Dz]
     z_mod_delta: torch.Tensor      # [B,N,T,Dz]
 
+    # optional diagnostics for paper-style regularizers
+    u_ctx: Optional[torch.Tensor] = None        # [B,N,T,A]
+    decision_features: Optional[torch.Tensor] = None  # [B,N,T,A,Dz]
+    recog_probs: Optional[torch.Tensor] = None  # [B,N,T,A]
+    recog_conf: Optional[torch.Tensor] = None   # [B,N,T]
 
-class LowRankTemplateModulation(nn.Module):
-    """Low-rank template-conditioned modulation in latent preference space.
 
-    Paper Eq.(7):
-        \tilde z = z + A(h_\tau, c) B z,  rank(A B) << d_z
+# ------------------------------
+# Geometry helpers
+# ------------------------------
 
-    We implement a practical version without explicit c_i (context id), using only h_\tau.
-    The low-rank form is enforced by mapping z -> r then back to d_z with a tau-conditioned matrix.
+def _smoothstep(u: torch.Tensor) -> torch.Tensor:
+    """Quintic smoothstep σ(u)=10u^3-15u^4+6u^5, with u assumed in [0,1]."""
+    return 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
 
-    Notes:
-      - This module is meant to be *weak*; regularize ||\tilde z - z||.
-      - We modulate the *sampled z* (or mean), and keep the base z coordinate system shared.
+
+def _project_to_polyline(
+    pts: torch.Tensor,          # [...,2]
+    poly: torch.Tensor,         # [...,L,2]
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project points onto a polyline and return (s, d, tangent).
+
+    This is a differentiable-ish (piecewise) projection that chooses the nearest segment.
+
+    Returns
+    -------
+    s : [...]
+        Arc-length coordinate along the polyline.
+    d : [...]
+        Signed lateral offset (left positive w.r.t. tangent direction).
+    tan : [...,2]
+        Unit tangent direction of the closest segment.
+    """
+    if pts.shape[-1] != 2 or poly.shape[-1] != 2:
+        raise ValueError("pts/poly must end with 2")
+    if poly.shape[-2] < 2:
+        s = torch.zeros_like(pts[..., 0])
+        d = torch.zeros_like(pts[..., 0])
+        tan = torch.zeros_like(pts)
+        tan[..., 0] = 1.0
+        return s, d, tan
+
+    p0 = poly[..., :-1, :]  # [...,L-1,2]
+    v = poly[..., 1:, :] - poly[..., :-1, :]  # [...,L-1,2]
+    v2 = (v * v).sum(dim=-1).clamp_min(eps)   # [...,L-1]
+    seg_len = torch.sqrt(v2)
+
+    # cumulative length before each segment
+    cum = torch.cumsum(seg_len, dim=-1)  # [...,L-1]
+    cum0 = torch.cat([torch.zeros_like(cum[..., :1]), cum[..., :-1]], dim=-1)
+
+    w = pts.unsqueeze(-2) - p0  # [...,L-1,2]
+    t = (w * v).sum(dim=-1) / v2
+    t = t.clamp(0.0, 1.0)
+    proj = p0 + t.unsqueeze(-1) * v
+    diff = pts.unsqueeze(-2) - proj
+    dist2 = (diff * diff).sum(dim=-1)
+
+    idx = dist2.argmin(dim=-1)  # [...]
+
+    # gather per-point segment quantities
+    idx1 = idx.unsqueeze(-1)  # [...,1]
+    t_sel = torch.gather(t, dim=-1, index=idx1).squeeze(-1)
+    len_sel = torch.gather(seg_len, dim=-1, index=idx1).squeeze(-1)
+    cum_sel = torch.gather(cum0, dim=-1, index=idx1).squeeze(-1)
+    dist2_sel = torch.gather(dist2, dim=-1, index=idx1).squeeze(-1)
+
+    idx2 = idx1.unsqueeze(-1)
+    v_sel = torch.gather(v, dim=-2, index=idx2.expand(*v.shape[:-2], 1, 2)).squeeze(-2)
+    diff_sel = torch.gather(diff, dim=-2, index=idx2.expand(*diff.shape[:-2], 1, 2)).squeeze(-2)
+    s = cum_sel + t_sel * len_sel
+
+    cross = v_sel[..., 0] * diff_sel[..., 1] - v_sel[..., 1] * diff_sel[..., 0]
+    sign = torch.sign(cross)
+    sign = torch.where(sign == 0.0, torch.ones_like(sign), sign)
+    d = sign * torch.sqrt(dist2_sel.clamp_min(eps))
+
+    tan = v_sel / len_sel.unsqueeze(-1).clamp_min(eps)
+    return s, d, tan
+
+
+def _gather_polylines(
+    map_polylines: torch.Tensor,   # [B,M,L,2]
+    idx: torch.Tensor,             # [B,*,] int64
+) -> torch.Tensor:
+    """Gather polylines along M using advanced indexing."""
+    B, M, L, _ = map_polylines.shape
+    if idx.dtype != torch.long:
+        idx = idx.long()
+    flat = idx.view(B, -1)
+    b = torch.arange(B, device=map_polylines.device).view(B, 1).expand_as(flat)
+    gathered = map_polylines[b, flat]  # [B,*,L,2]
+    return gathered.view(*idx.shape, L, 2)
+
+
+# ------------------------------
+# Paper-style random utility policy π(m | z, τ^{det})
+# ------------------------------
+
+
+class PaperStructuredActionUtility(nn.Module):
+    """Random-utility policy over structured action slots.
+
+    Implements the paper form:
+
+        U(m; z, τ^{det}) = z^T f(m, τ^{det}) + u_ctx(m, τ^{det})
+
+    where f is a vector of physically-comparable features (dim=z_dim), and u_ctx is a
+    low-capacity preference-independent baseline encoding hard rules/feasibility.
+
+    We avoid any template-conditioned modulation of z.
     """
 
     def __init__(
         self,
         *,
         z_dim: int,
-        tau_dim: int,
-        rank: int = 4,
-        hidden_dim: int = 64,
-    ) -> None:
-        super().__init__()
-        self.z_dim = int(z_dim)
-        self.tau_dim = int(tau_dim)
-        self.rank = int(rank)
-
-        # B: z -> r
-        self.B = nn.Linear(self.z_dim, self.rank, bias=False)
-
-        # A_theta: tau -> (d_z x r)
-        self.A = nn.Sequential(
-            nn.Linear(self.tau_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.z_dim * self.rank),
-        )
-
-        # Initialize near-zero modulation
-        nn.init.zeros_(self.A[-1].weight)
-        nn.init.zeros_(self.A[-1].bias)
-
-    def forward(self, z: torch.Tensor, tau: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute modulated preference.
-
-        Args:
-          z:   [B,N,Dz]
-          tau: [B,N,T,Dt] or [B,N,Dt]
-        Returns:
-          z_mod:       [B,N,T,Dz] (or [B,N,1,Dz] if tau is [B,N,Dt])
-          z_mod_delta: [B,N,T,Dz]
-        """
-        if tau.dim() == 3:
-            tau_e = tau.unsqueeze(2)  # [B,N,1,Dt]
-        elif tau.dim() == 4:
-            tau_e = tau
-        else:
-            raise ValueError(f"tau must be [B,N,Dt] or [B,N,T,Dt], got {tau.shape}")
-
-        B, N, T, Dt = tau_e.shape
-        assert Dt == self.tau_dim
-        Dz = z.shape[-1]
-        assert Dz == self.z_dim
-
-        # z -> r
-        bz = self.B(z)  # [B,N,r]
-        bz = bz.unsqueeze(2).expand(B, N, T, self.rank)  # [B,N,T,r]
-
-        # tau -> A matrices
-        tau_n = F.layer_norm(tau_e, (tau_e.shape[-1],))
-        A = self.A(tau_n).view(B, N, T, self.z_dim, self.rank)  # [B,N,T,Dz,r]
-
-        delta = torch.einsum("bntdr,bntr->bntd", A, bz)
-        z_base = z.unsqueeze(2).expand(B, N, T, self.z_dim)
-        return z_base + delta, delta
-
-
-class RandomUtilityManeuverPolicy(nn.Module):
-    """Random-utility maneuver model (paper Eq.(8)-(9)).
-
-      U(m; z, tau) = z^T Phi_int(m, tau) + u_ctx(m, tau)
-      p(m|z,tau) ∝ exp(U/β)
-
-    We implement Phi_int and u_ctx with small MLPs on (tau, maneuver_emb).
-    """
-
-    def __init__(
-        self,
-        *,
-        tau_dim: int,
-        z_dim: int,
-        num_maneuvers: int,
-        m_emb_dim: int = 16,
-        hidden_dim: int = 64,
         beta: float = 1.0,
+        ctx_in_dim: int = 3,
     ) -> None:
         super().__init__()
-        self.tau_dim = int(tau_dim)
         self.z_dim = int(z_dim)
-        self.num_maneuvers = int(num_maneuvers)
         self.beta = float(beta)
 
-        self.m_emb = nn.Embedding(self.num_maneuvers, int(m_emb_dim))
+        # low-capacity u_ctx: linear in a small hand-designed context feature vector.
+        self.u_ctx_w = nn.Parameter(torch.zeros(ctx_in_dim))
+        self.u_ctx_b = nn.Parameter(torch.zeros(()))
 
-        in_dim = self.tau_dim + int(m_emb_dim)
-        self.phi = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.z_dim),
-        )
-
-        # low-capacity context-only baseline
-        self.u_ctx = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
-        # initialize near 0
-        nn.init.zeros_(self.phi[-1].weight)
-        nn.init.zeros_(self.phi[-1].bias)
-        nn.init.zeros_(self.u_ctx[-1].weight)
-        nn.init.zeros_(self.u_ctx[-1].bias)
-
-    def forward(self, z_mod: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        """Return maneuver logits per token.
-
-        Args:
-          z_mod: [B,N,T,Dz]
-          tau:   [B,N,T,Dt]
-        Returns:
-          logits: [B,N,T,M]
-        """
-        B, N, T, Dz = z_mod.shape
-        assert Dz == self.z_dim
-        assert tau.shape[:3] == (B, N, T)
-
-        m_ids = torch.arange(self.num_maneuvers, device=z_mod.device)
-        m_emb = self.m_emb(m_ids)  # [M,Dm]
-
-        tau_e = tau.unsqueeze(-2).expand(B, N, T, self.num_maneuvers, self.tau_dim)
-        m_e = m_emb.view(1, 1, 1, self.num_maneuvers, -1).expand(B, N, T, self.num_maneuvers, -1)
-        inp = torch.cat([tau_e, m_e], dim=-1)  # [B,N,T,M,*]
-
-        phi = self.phi(inp)  # [B,N,T,M,Dz]
-        u = self.u_ctx(inp).squeeze(-1)  # [B,N,T,M]
-
-        # dot product preference term
-        logits = (z_mod.unsqueeze(-2) * phi).sum(dim=-1) + u
-        logits = logits / max(1e-6, self.beta)
-        return logits
-
-
-class TokenEmissionDecoder(nn.Module):
-    """Per-token emission model p(x_t | m, z, tau, ctx).
-
-    This is a lightweight surrogate for the paper's primitive likelihood with xi marginalization.
-    It keeps the API compatible with latent-maneuver marginalization in PreferenceCompletion.
-
-    You can replace this module with a Frenet primitive likelihood later without changing
-    the preference-completion training code.
-    """
-
-    def __init__(
+    def forward(
         self,
         *,
-        x_dim: int,
-        tau_dim: int,
-        ctx_dim: int,
-        z_dim: int,
-        num_maneuvers: int,
-        hidden_dim: int = 128,
-        min_logstd: float = -5.0,
-        max_logstd: float = 2.0,
-    ) -> None:
-        super().__init__()
-        self.x_dim = int(x_dim)
-        self.tau_dim = int(tau_dim)
-        self.ctx_dim = int(ctx_dim)
-        self.z_dim = int(z_dim)
-        self.num_maneuvers = int(num_maneuvers)
-        self.min_logstd = float(min_logstd)
-        self.max_logstd = float(max_logstd)
+        z: torch.Tensor,                 # [B,N,Dz]
+        decision_features: torch.Tensor,  # [B,N,T,A,Dz]
+        ctx_features: torch.Tensor,       # [B,N,T,A,Dc]
+        feasible_actions: Optional[torch.Tensor] = None,  # [B,N,T,A]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if z.shape[-1] != self.z_dim:
+            raise ValueError(f"z last dim must be {self.z_dim}, got {z.shape[-1]}")
+        if decision_features.shape[-1] != self.z_dim:
+            raise ValueError(f"decision_features last dim must be {self.z_dim}, got {decision_features.shape[-1]}")
 
-        in_dim = self.x_dim * 0 + self.tau_dim + self.ctx_dim + self.z_dim  # (no x in params)
-        self.trunk = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
+        B, N, T, A, _ = decision_features.shape
+        z_e = z.unsqueeze(2).unsqueeze(-2).expand(B, N, T, A, self.z_dim)
 
-        self.to_mean = nn.Linear(hidden_dim, self.num_maneuvers * self.x_dim)
-        self.to_logstd = nn.Linear(hidden_dim, self.num_maneuvers * self.x_dim)
+        # u_ctx baseline
+        u = (ctx_features * self.u_ctx_w.view(1, 1, 1, 1, -1)).sum(dim=-1) + self.u_ctx_b
 
-        nn.init.zeros_(self.to_mean.weight)
-        nn.init.zeros_(self.to_mean.bias)
-        nn.init.zeros_(self.to_logstd.weight)
-        nn.init.constant_(self.to_logstd.bias, -1.0)
-
-    def forward(self, *, z_mod: torch.Tensor, tau: torch.Tensor, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return per-maneuver Gaussian parameters for each token.
-
-        Args:
-          z_mod: [B,N,T,Dz]
-          tau:   [B,N,T,Dt]
-          ctx:   [B,N,T,Dc]
-        Returns:
-          mean:   [B,N,T,M,Dx]
-          logstd: [B,N,T,M,Dx]
-        """
-        h = self.trunk(torch.cat([z_mod, tau, ctx], dim=-1))
-        B, N, T, _ = h.shape
-        mean = self.to_mean(h).view(B, N, T, self.num_maneuvers, self.x_dim)
-        logstd = self.to_logstd(h).view(B, N, T, self.num_maneuvers, self.x_dim)
-        logstd = logstd.clamp(min=self.min_logstd, max=self.max_logstd)
-        return mean, logstd
-
-
-class FrenetMarginalEmission(nn.Module):
-    """Template-conditioned Frenet-like motion primitives with analytic xi marginalization.
-
-    This is a *paper-aligned* implementation of p(x_t | m, τ_t) with a continuous
-    primitive parameter xi marginalized out (analytic linear-Gaussian case).
-
-    We model one-step action tokens x = [Δx, Δy, Δyaw]. We rotate (Δx,Δy) into the
-    agent heading frame defined by ctx yaw, yielding x' = [Δs, Δd, Δyaw].
-
-    For each maneuver m we use:
-      x' = b(ctx) + A_m xi + ε
-      xi ~ N(μ_m(τ,ctx), diag(σ^2_xi,m(τ,ctx)))
-      ε  ~ N(0, diag(σ^2_ε,m(τ,ctx)))
-
-    Integrating out xi yields a diagonal Gaussian with
-      mean = b + A_m μ_m
-      var  = σ^2_ε,m + diag(A_m^2) σ^2_xi,m
-
-    Notes:
-      - We keep xi dimension fixed at 2: [a_s, aux].
-        aux is interpreted as lateral acceleration (lane-change) or yaw-rate (turn).
-      - This keeps training stable while matching the paper's discrete+continuous primitive form.
-    """
-
-    def __init__(
-        self,
-        *,
-        x_dim: int,
-        tau_dim: int,
-        ctx_dim: int,
-        z_dim: int = 0,
-        num_maneuvers: int,
-        hidden_dim: int = 128,
-        dt: float = 0.1,
-        min_logstd: float = -5.0,
-        max_logstd: float = 2.0,
-    ) -> None:
-        super().__init__()
-        if int(x_dim) != 3:
-            raise ValueError("FrenetMarginalEmission expects x_dim=3 for [dx,dy,dyaw].")
-        self.x_dim = int(x_dim)
-        self.tau_dim = int(tau_dim)
-        self.ctx_dim = int(ctx_dim)
-        self.z_dim = int(z_dim)
-        self.num_maneuvers = int(num_maneuvers)
-        self.dt = float(dt)
-        self.min_logstd = float(min_logstd)
-        self.max_logstd = float(max_logstd)
-
-        in_dim = self.tau_dim + self.ctx_dim + (self.z_dim if self.z_dim > 0 else 0)
-        self.trunk = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        # token-conditioned deltas for primitive parameters
-        self.to_dmu = nn.Linear(hidden_dim, self.num_maneuvers * 2)
-        self.to_dlogvar = nn.Linear(hidden_dim, self.num_maneuvers * 2)
-        self.to_dlogstd_noise = nn.Linear(hidden_dim, self.num_maneuvers * 3)
-
-        # initialize deltas near 0
-        nn.init.zeros_(self.to_dmu.weight)
-        nn.init.zeros_(self.to_dmu.bias)
-        nn.init.zeros_(self.to_dlogvar.weight)
-        nn.init.zeros_(self.to_dlogvar.bias)
-        nn.init.zeros_(self.to_dlogstd_noise.weight)
-        nn.init.zeros_(self.to_dlogstd_noise.bias)
-
-        # Base priors (heuristic init aligned with MANEUVER_NAMES order)
-        mu0 = torch.zeros((self.num_maneuvers, 2))
-        if self.num_maneuvers >= 6:
-            # [keep_lane, lane_change_left, lane_change_right, turn_left, turn_right, stop]
-            mu0[0] = torch.tensor([0.0, 0.0])
-            mu0[1] = torch.tensor([0.0, 1.0])
-            mu0[2] = torch.tensor([0.0, -1.0])
-            mu0[3] = torch.tensor([0.0, 0.4])
-            mu0[4] = torch.tensor([0.0, -0.4])
-            mu0[5] = torch.tensor([-2.0, 0.0])
-        self.mu_xi_base = nn.Parameter(mu0)
-        self.logvar_xi_base = nn.Parameter(torch.full((self.num_maneuvers, 2), -0.5))
-        self.logstd_noise_base = nn.Parameter(torch.full((self.num_maneuvers, 3), -1.0))
-
-        # Maneuver-type masks (for xi[1] contribution)
-        lane_mask = torch.zeros((self.num_maneuvers,), dtype=torch.float32)
-        turn_mask = torch.zeros((self.num_maneuvers,), dtype=torch.float32)
-        if self.num_maneuvers >= 6:
-            lane_mask[1] = 1.0
-            lane_mask[2] = 1.0
-            turn_mask[3] = 1.0
-            turn_mask[4] = 1.0
-        self.register_buffer("lane_change_mask", lane_mask)
-        self.register_buffer("turn_mask", turn_mask)
-
-    @staticmethod
-    def _rotate_to_heading(x: torch.Tensor, y: torch.Tensor, yaw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        cy = torch.cos(yaw)
-        sy = torch.sin(yaw)
-        s = cy * x + sy * y
-        d = -sy * x + cy * y
-        return s, d
-
-    @staticmethod
-    def _log_prob_diag_normal(x: torch.Tensor, mean: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
-        var = torch.exp(2.0 * logstd)
-        return -0.5 * (((x - mean) ** 2) / (var + 1e-8) + 2.0 * logstd + math.log(2.0 * math.pi)).sum(dim=-1)
-
-    def log_prob(
-        self,
-        *,
-        x: torch.Tensor,
-        tau: torch.Tensor,
-        ctx: torch.Tensor,
-        z_mod: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Return log p(x | m, τ, ctx) for each maneuver.
-
-        Args:
-          x:   [B,N,T,3] action tokens (dx,dy,dyaw) in ego frame
-          tau: [B,N,T,Dt]
-          ctx: [B,N,T,Dc] where ctx[...,2]=yaw, ctx[...,3:5]=vx,vy
-          z_mod: [B,N,T,Dz] (optional). If provided and z_dim>0, we condition primitive
-            parameters on preferences as in the paper p(xi | m, z, tau).
-        Returns:
-          logp: [B,N,T,M]
-        """
-        B, N, T, Dx = x.shape
-        if Dx != 3:
-            raise ValueError("x must be [...,3] for [dx,dy,dyaw]")
-
-        yaw = ctx[..., 2]
-        dx, dy, dyaw = x[..., 0], x[..., 1], x[..., 2]
-        ds_obs, dd_obs = self._rotate_to_heading(dx, dy, yaw)
-
-        vx, vy = ctx[..., 3], ctx[..., 4]
-        vs, vd = self._rotate_to_heading(vx, vy, yaw)
-
-        dt = self.dt
-        c_acc = 0.5 * (dt**2)
-        c_yaw = dt
-
-        # base increment b(ctx)
-        b_ds = vs * dt
-        b_dd = vd * dt
-
-        if self.z_dim > 0:
-            if z_mod is None:
-                raise ValueError("FrenetMarginalEmission requires z_mod when z_dim>0")
-            if z_mod.shape[:3] != tau.shape[:3] or z_mod.shape[-1] != self.z_dim:
-                raise ValueError(f"z_mod must have shape [B,N,T,{self.z_dim}], got {tuple(z_mod.shape)}")
-            h_in = torch.cat([tau, ctx, z_mod], dim=-1)
+        # enforce zero-mean u_ctx within each (B,N,T) template family, over feasible actions
+        if feasible_actions is not None:
+            fa = feasible_actions.to(dtype=torch.bool)
+            any_fa = fa.any(dim=-1, keepdim=True)
+            fa = torch.where(any_fa, fa, torch.ones_like(fa))
+            u_mean = (u.masked_fill(~fa, 0.0).sum(dim=-1, keepdim=True) / fa.to(dtype=u.dtype).sum(dim=-1, keepdim=True).clamp_min(1e-6))
+            u = u - u_mean
         else:
-            h_in = torch.cat([tau, ctx], dim=-1)
-        h = self.trunk(h_in)
-        dmu = self.to_dmu(h).view(B, N, T, self.num_maneuvers, 2)
-        dlogvar = self.to_dlogvar(h).view(B, N, T, self.num_maneuvers, 2)
-        dlogstd_noise = self.to_dlogstd_noise(h).view(B, N, T, self.num_maneuvers, 3)
+            u = u - u.mean(dim=-1, keepdim=True)
 
-        mu_xi = self.mu_xi_base.view(1, 1, 1, self.num_maneuvers, 2) + dmu
-        logvar_xi = self.logvar_xi_base.view(1, 1, 1, self.num_maneuvers, 2) + dlogvar
-        logvar_xi = logvar_xi.clamp(min=-10.0, max=10.0)
-        logstd_noise = (self.logstd_noise_base.view(1, 1, 1, self.num_maneuvers, 3) + dlogstd_noise).clamp(
-            min=self.min_logstd, max=self.max_logstd
+        logits = (z_e * decision_features).sum(dim=-1) + u
+        logits = logits / max(1e-6, self.beta)
+        return logits, u
+
+
+# ------------------------------
+# Paper-style primitive likelihood p_n(X | m, ξ, τ^{det}) (MAP approximation)
+# ------------------------------
+
+
+class TemplatePrimitiveLikelihood(nn.Module):
+    """Lightweight template-conditioned primitive likelihood.
+
+    This is a pragmatic, *deterministic* instantiation of Appendix Sec.\ref{sec:primitive_likelihood}.
+
+    - We compute action-conditioned residuals in a Frenet-like frame defined by the selected
+      reference path branch.
+    - We use fixed maneuver-dependent weights w_m and diagonal noise scales.
+    - Continuous primitive parameters ξ are approximated by a small MAP proxy:
+        * lane-change splice parameter ρ is selected by a short grid search
+        * δd and a_adj are not explicitly optimized here (we use δd=0 and a_adj absorbed
+          into the baseline acceleration heuristic)
+
+    The goal is to supply a stable recognition signal q_χ(m|X,τ^{det}) without allowing
+    z → motion leakage.
+    """
+
+    def __init__(
+        self,
+        *,
+        dt: float = 0.1,
+        lane_width: float = 3.6,
+        topo_horizon_m: float = 50.0,
+        conflict_time_s: float = 5.0,
+        a_min: float = -4.0,
+        a_max: float = 2.0,
+        k_yield: float = 1.5,
+        rho_grid: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8),
+        L_prep: float = 10.0,
+        L_lc: float = 30.0,
+        # base noise scales for residual components [s, d, v, a]
+        sigma_s: float = 1.0,
+        sigma_d: float = 0.5,
+        sigma_v: float = 1.0,
+        sigma_a: float = 1.5,
+    ) -> None:
+        super().__init__()
+        self.dt = float(dt)
+        self.lane_width = float(lane_width)
+        self.topo_horizon_m = float(topo_horizon_m)
+        self.conflict_time_s = float(conflict_time_s)
+        self.a_min = float(a_min)
+        self.a_max = float(a_max)
+        self.k_yield = float(k_yield)
+        self.rho_grid = tuple(float(r) for r in rho_grid)
+        self.L_prep = float(L_prep)
+        self.L_lc = float(L_lc)
+
+        self.sigma = torch.tensor([sigma_s, sigma_d, sigma_v, sigma_a], dtype=torch.float32)
+
+        # Fixed semantic weights w_m (Appendix "Fixed primitive weights")
+        # Each is [w_s, w_d, w_v, w_a].
+        self.register_buffer(
+            "w_by_family",
+            torch.tensor(
+                [
+                    # KEEP
+                    [1.2, 0.2, 1.0, 0.6],
+                    # LCL
+                    [0.9, 1.2, 0.9, 0.6],
+                    # LCR
+                    [0.9, 1.2, 0.9, 0.6],
+                    # TURN_LEFT
+                    [1.0, 0.4, 0.9, 0.6],
+                    # TURN_RIGHT
+                    [1.0, 0.4, 0.9, 0.6],
+                    # STOP
+                    [1.1, 0.2, 1.0, 0.2],
+                ],
+                dtype=torch.float32,
+            ),
         )
 
-        var_xi = torch.exp(logvar_xi)
-        var_noise = torch.exp(2.0 * logstd_noise)
+    def _baseline_acc(
+        self,
+        *,
+        speed: torch.Tensor,                # [B,N,T]
+        constraint_type: torch.Tensor,       # [A] (int)
+        comparable_metrics: torch.Tensor,    # [B,N,T,A,C]
+    ) -> torch.Tensor:
+        """Low-capacity heuristic acceleration baseline \bar a(K_dyn).
 
-        lane = self.lane_change_mask.view(1, 1, 1, self.num_maneuvers)
-        turn = self.turn_mask.view(1, 1, 1, self.num_maneuvers)
+        This is intentionally simple and preference-independent.
+        """
+        # constraint_type is per-slot constant, broadcast
+        B, N, T, A, _ = comparable_metrics.shape
+        c = constraint_type.view(1, 1, 1, A).expand(B, N, T, A)
 
-        mean_ds = b_ds.unsqueeze(-1) + c_acc * mu_xi[..., 0]
-        mean_dd = b_dd.unsqueeze(-1) + lane * (c_acc * mu_xi[..., 1])
-        mean_dyaw = turn * (c_yaw * mu_xi[..., 1])
+        speed_e = speed.unsqueeze(-1).expand(B, N, T, A)
 
-        var_ds = var_noise[..., 0] + (c_acc**2) * var_xi[..., 0]
-        var_dd = var_noise[..., 1] + lane * ((c_acc**2) * var_xi[..., 1])
-        var_dyaw = var_noise[..., 2] + turn * ((c_yaw**2) * var_xi[..., 1])
+        # gap in meters (only meaningful for Follow/Yield slots as encoded by extractor)
+        gap = comparable_metrics[..., 1] * self.topo_horizon_m
+        ttc = comparable_metrics[..., 2] * self.conflict_time_s
 
-        var = torch.stack([var_ds, var_dd, var_dyaw], dim=-1).clamp_min(1e-6)
-        mean = torch.stack([mean_ds, mean_dd, mean_dyaw], dim=-1)
-        logstd = 0.5 * torch.log(var)
+        a = torch.zeros_like(gap)
 
-        x_obs = torch.stack([ds_obs, dd_obs, dyaw], dim=-1).unsqueeze(-2)  # [B,N,T,1,3]
-        return self._log_prob_diag_normal(x_obs, mean, logstd)  # [B,N,T,M]
+        # STOP_LINE: decelerate if moving
+        stop_mask = c == int(LonConstraint.STOP_LINE)
+        a_stop = torch.where(speed_e > 0.5, -1.5 * torch.ones_like(a), torch.zeros_like(a))
+        a = torch.where(stop_mask, a_stop, a)
+
+        # FOLLOW: proportional gap control
+        follow_mask = c == int(LonConstraint.FOLLOW)
+        desired = 1.5 * speed_e + 2.0
+        a_follow = 0.3 * (gap - desired)
+        a_follow = a_follow.clamp(min=self.a_min, max=self.a_max)
+        a = torch.where(follow_mask, a_follow, a)
+
+        # YIELD_TO: decelerate if TTC is small
+        yield_mask = c == int(LonConstraint.YIELD_TO)
+        a_y = torch.where(ttc < 2.0, -self.k_yield * torch.ones_like(a), torch.zeros_like(a))
+        a = torch.where(yield_mask, a_y, a)
+
+        return a.clamp(min=self.a_min, max=self.a_max)
+
+    def _lane_change_splice(
+        self,
+        *,
+        keep_poly: torch.Tensor,     # [B,N,T,L,2]
+        tgt_poly: torch.Tensor,      # [B,N,T,L,2]
+        s0_keep: torch.Tensor,       # [B,N,T]
+        rho: float,
+    ) -> torch.Tensor:
+        """Blend keep → target lane using Appendix splice rule (approx in Cartesian)."""
+        # arc-length along keep points
+        seg = keep_poly[..., 1:, :] - keep_poly[..., :-1, :]
+        seg_len = torch.sqrt((seg * seg).sum(dim=-1).clamp_min(1e-8))
+        s_pts = torch.cumsum(seg_len, dim=-1)
+        s_pts = torch.cat([torch.zeros_like(s_pts[..., :1]), s_pts], dim=-1)  # [B,N,T,L]
+
+        s_start = s0_keep + float(rho) * self.L_prep
+        u = ((s_pts - s_start.unsqueeze(-1)) / max(1e-6, self.L_lc)).clamp(0.0, 1.0)
+        alpha = _smoothstep(u)
+        # Cartesian blend (pragmatic)
+        return keep_poly * (1.0 - alpha.unsqueeze(-1)) + tgt_poly * alpha.unsqueeze(-1)
+
+    def _log_prob_diag(self, e: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Compute log N(e; 0, diag(sigma^2 / w)).
+
+        e: [...,4], w: [...,4]
+        """
+        sigma = self.sigma.to(device=e.device, dtype=e.dtype)
+        var = (sigma**2).view(1, 1, 1, 1, 4) / w.clamp_min(1e-6)
+        log_det = torch.log(var.clamp_min(1e-12)).sum(dim=-1)
+        quad = (e**2 / var.clamp_min(1e-12)).sum(dim=-1)
+        return -0.5 * (quad + log_det + 4.0 * math.log(2.0 * math.pi))
+
+    def forward(
+        self,
+        *,
+        x: torch.Tensor,                     # [B,N,T,3] (Δx,Δy,Δyaw) ego frame
+        ctx: torch.Tensor,                   # [B,N,T,5] (x,y,yaw,vx,vy)
+        feasible_actions: Optional[torch.Tensor],   # [B,N,T,A]
+        action_path_type: torch.Tensor,      # [A]
+        action_constraint_type: torch.Tensor,  # [A]
+        comparable_metrics: torch.Tensor,     # [B,N,T,A,C]
+        path_polyline_idx: torch.Tensor,      # [B,N,T,P]
+        map_polylines: torch.Tensor,          # [B,M,L,2]
+    ) -> torch.Tensor:
+        """Compute logp_x_given_m for each structured action slot."""
+        B, N, T, Dx = x.shape
+        if Dx < 2:
+            raise ValueError("x must contain at least Δx,Δy")
+
+        # current / next positions in ego frame
+        p0 = ctx[..., 0:2]
+        p1 = p0 + x[..., 0:2]
+
+        # current velocity
+        vx = ctx[..., 3]
+        vy = ctx[..., 4]
+        v_vec = torch.stack([vx, vy], dim=-1)  # [B,N,T,2]
+
+        # gather per-path polylines (P path branches)
+        # path_polyline_idx: [B,N,T,P]
+        P = path_polyline_idx.shape[-1]
+        if P != NUM_PATH_TYPES:
+            raise ValueError(f"path_polyline_idx last dim must be {NUM_PATH_TYPES}, got {P}")
+
+        # pre-gather keep and each path type polyline
+        poly_by_path = _gather_polylines(map_polylines, path_polyline_idx)  # [B,N,T,P,L,2]
+
+        # project onto KEEP (needed for lane-change splice start)
+        keep_poly = poly_by_path[..., int(PathType.KEEP), :, :]
+        s0_keep, _, _ = _project_to_polyline(p0, keep_poly)
+
+        # compute s,d,tan for each path type, with lane-change splice + rho grid
+        # We'll assemble tensors [B,N,T,P] for s0,s1,d1,tan0.
+        s0_all = p0.new_zeros((B, N, T, P))
+        s1_all = p0.new_zeros((B, N, T, P))
+        d1_all = p0.new_zeros((B, N, T, P))
+        tan0_all = p0.new_zeros((B, N, T, P, 2))
+
+        for p in range(P):
+            if p in (int(PathType.LANE_CHANGE_LEFT), int(PathType.LANE_CHANGE_RIGHT)):
+                # MAP over rho via small grid search
+                tgt_poly = poly_by_path[..., p, :, :]
+                best_lp = None
+                best_s0 = None
+                best_s1 = None
+                best_d1 = None
+                best_tan0 = None
+                for rho in self.rho_grid:
+                    splice = self._lane_change_splice(keep_poly=keep_poly, tgt_poly=tgt_poly, s0_keep=s0_keep, rho=rho)
+                    s0, d0, tan0 = _project_to_polyline(p0, splice)
+                    s1, d1, _ = _project_to_polyline(p1, splice)
+
+                    # quick score: prefer small |d1| and consistent longitudinal step
+                    v_s = (v_vec * tan0).sum(dim=-1)
+                    s_hat = s0 + v_s * self.dt
+                    e_s = s1 - s_hat
+                    score = -(d1.abs() + 0.1 * e_s.abs())  # higher better
+
+                    if best_lp is None:
+                        best_lp = score
+                        best_s0, best_s1, best_d1, best_tan0 = s0, s1, d1, tan0
+                    else:
+                        better = score > best_lp
+                        best_lp = torch.where(better, score, best_lp)
+                        best_s0 = torch.where(better, s0, best_s0)
+                        best_s1 = torch.where(better, s1, best_s1)
+                        best_d1 = torch.where(better, d1, best_d1)
+                        best_tan0 = torch.where(better.unsqueeze(-1), tan0, best_tan0)
+
+                s0_all[..., p] = best_s0
+                s1_all[..., p] = best_s1
+                d1_all[..., p] = best_d1
+                tan0_all[..., p, :] = best_tan0
+            else:
+                poly = poly_by_path[..., p, :, :]
+                s0, d0, tan0 = _project_to_polyline(p0, poly)
+                s1, d1, _ = _project_to_polyline(p1, poly)
+                s0_all[..., p] = s0
+                s1_all[..., p] = s1
+                d1_all[..., p] = d1
+                tan0_all[..., p, :] = tan0
+
+        # now compute per-slot residuals and log probs
+        A = action_path_type.numel()
+        p_slot = action_path_type.view(1, 1, 1, A).expand(B, N, T, A)
+
+        # select path-coordinates for each slot
+        # gather along P
+        s0 = torch.gather(s0_all, dim=-1, index=p_slot)
+        s1 = torch.gather(s1_all, dim=-1, index=p_slot)
+        d1 = torch.gather(d1_all, dim=-1, index=p_slot)
+
+        tan0 = torch.gather(tan0_all, dim=-2, index=p_slot.unsqueeze(-1).expand(B, N, T, A, 2))
+
+        # along-path speed
+        v_s = (v_vec.unsqueeze(-2) * tan0).sum(dim=-1)
+
+        # observed along-path speed/acc
+        v_obs = (s1 - s0) / max(1e-6, self.dt)
+        a_obs = (v_obs - v_s) / max(1e-6, self.dt)
+
+        # baseline acc per slot
+        a_bar = self._baseline_acc(speed=torch.sqrt(vx**2 + vy**2 + 1e-8), constraint_type=action_constraint_type, comparable_metrics=comparable_metrics)
+
+        v_hat = v_s + a_bar * self.dt
+        s_hat = s0 + v_s * self.dt + 0.5 * a_bar * (self.dt**2)
+
+        e_s = s1 - s_hat
+        e_d = d1  # δd=0
+        e_v = v_obs - v_hat
+        e_a = a_obs - a_bar
+
+        e = torch.stack([e_s, e_d, e_v, e_a], dim=-1)  # [B,N,T,A,4]
+
+        # maneuver-family weights
+        fam = torch.tensor(
+            [path_constraint_to_maneuver(int(action_path_type[a]), int(action_constraint_type[a])) for a in range(A)],
+            device=x.device,
+            dtype=torch.long,
+        )
+        w = self.w_by_family[fam]  # [A,4]
+        w = w.view(1, 1, 1, A, 4).to(device=x.device, dtype=x.dtype).expand(B, N, T, A, 4)
+
+        # speed-dependent down-weighting for STOP acceleration near standstill
+        is_stop = (fam.view(1, 1, 1, A) == int(Maneuver.STOP)).to(dtype=x.dtype)
+        speed = torch.sqrt(vx**2 + vy**2 + 1e-8).unsqueeze(-1)
+        w_a = w[..., 3] * (0.1 + 0.9 * (speed > 1.0).to(dtype=x.dtype))
+        w = torch.cat([w[..., :3], w_a.unsqueeze(-1)], dim=-1)
+
+        logp = self._log_prob_diag(e, w)  # [B,N,T,A]
+
+        # mask infeasible to avoid corrupting recognition
+        if feasible_actions is not None:
+            fa = feasible_actions.to(dtype=torch.bool)
+            any_fa = fa.any(dim=-1, keepdim=True)
+            fa = torch.where(any_fa, fa, torch.ones_like(fa))
+            logp = logp.masked_fill(~fa, float("-inf"))
+
+        return logp
+
+
+# ------------------------------
+# Decoder wrapper
+# ------------------------------
 
 
 class MotionPrimitiveDecoder(nn.Module):
-    """Maneuver + token emission decoder used by preference completion.
+    """Structured action decoder used by preference completion.
 
-    The paper specifies:
-      - random-utility maneuver model p(m|z, tau)
-      - continuous parameters xi and a template-conditioned primitive likelihood p(X|m,xi,tau)
+    This decoder exposes:
+    - π(m | z, τ^{det}) via a paper-style random-utility policy
+    - p_n(X | m, τ^{det}) via a template-conditioned primitive likelihood
 
-    This repo implements a faithful *interface*:
-      - p(m|z,tau) via a random-utility model in latent space
-      - p(x|m,z,tau,ctx) as a small diagonal-Gaussian emission model
-
-    The emission can be swapped for a full Frenet primitive likelihood without touching
-    PreferenceCompletion (stage-1 training).
+    Importantly, the motion likelihood does not depend on z (no leakage).
     """
 
     def __init__(
@@ -450,17 +529,18 @@ class MotionPrimitiveDecoder(nn.Module):
         ctx_dim: int,
         z_dim: int,
         num_maneuvers: int = NUM_MANEUVERS,
-        hidden_dim: int = 128,
-        mod_rank: int = 4,
-        mod_hidden: int = 64,
-        utility_hidden: int = 64,
         beta: float = 1.0,
-        # Feasible-action handling
         feasible_action_penalty: float = 5.0,
         feasible_action_soft_penalty_train: bool = True,
         feasible_action_hard_mask_eval: bool = True,
-        emission_type: str = "frenet",
         dt: float = 0.1,
+        lane_width: float = 3.6,
+        topo_horizon_m: float = 50.0,
+        conflict_time_s: float = 5.0,
+        a_min: float = -4.0,
+        a_max: float = 2.0,
+        k_yield: float = 1.5,
+        rho_grid: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8),
     ) -> None:
         super().__init__()
         self.x_dim = int(x_dim)
@@ -473,109 +553,288 @@ class MotionPrimitiveDecoder(nn.Module):
         self.feasible_action_soft_penalty_train = bool(feasible_action_soft_penalty_train)
         self.feasible_action_hard_mask_eval = bool(feasible_action_hard_mask_eval)
 
-        self.modulation = LowRankTemplateModulation(z_dim=z_dim, tau_dim=tau_dim, rank=mod_rank, hidden_dim=mod_hidden)
-        self.policy = RandomUtilityManeuverPolicy(
-            tau_dim=tau_dim,
-            z_dim=z_dim,
-            num_maneuvers=num_maneuvers,
-            hidden_dim=utility_hidden,
-            beta=beta,
+        self.policy = PaperStructuredActionUtility(z_dim=self.z_dim, beta=float(beta), ctx_in_dim=3)
+        self.primitive = TemplatePrimitiveLikelihood(
+            dt=float(dt),
+            lane_width=float(lane_width),
+            topo_horizon_m=float(topo_horizon_m),
+            conflict_time_s=float(conflict_time_s),
+            a_min=float(a_min),
+            a_max=float(a_max),
+            k_yield=float(k_yield),
+            rho_grid=rho_grid,
         )
-        etype = str(emission_type).lower()
-        if etype in ("frenet", "primitive", "marginal_frenet"):
-            self.emission: nn.Module = FrenetMarginalEmission(
-                x_dim=x_dim,
-                tau_dim=tau_dim,
-                ctx_dim=ctx_dim,
-                z_dim=z_dim,
-                num_maneuvers=num_maneuvers,
-                hidden_dim=hidden_dim,
-                dt=float(dt),
-            )
-        elif etype in ("gaussian", "mlp", "surrogate"):
-            self.emission = TokenEmissionDecoder(
-                x_dim=x_dim,
-                tau_dim=tau_dim,
-                ctx_dim=ctx_dim,
-                z_dim=z_dim,
-                num_maneuvers=num_maneuvers,
-                hidden_dim=hidden_dim,
-            )
-        else:
-            raise ValueError(f"Unknown emission_type={emission_type!r}. Use 'frenet' or 'gaussian'.")
+
+        # fixed slot definitions (path × lon), used if caller does not supply per-slot tensors
+        slot_path = []
+        slot_lon = []
+        for p in range(NUM_PATH_TYPES):
+            for c in range(NUM_LON_CONSTRAINTS):
+                slot_path.append(p)
+                slot_lon.append(c)
+        self.register_buffer("slot_path_type", torch.tensor(slot_path, dtype=torch.long), persistent=False)
+        self.register_buffer("slot_constraint_type", torch.tensor(slot_lon, dtype=torch.long), persistent=False)
 
     @staticmethod
-    def _log_prob_diag_normal(x: torch.Tensor, mean: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
-        # x: [...,Dx], mean/logstd: [...,Dx]
-        var = torch.exp(2.0 * logstd)
-        return -0.5 * (((x - mean) ** 2) / (var + 1e-8) + 2.0 * logstd + math.log(2.0 * math.pi)).sum(dim=-1)
+    def aggregate_family_logits(
+        action_logits: torch.Tensor,
+        *,
+        action_family: Optional[torch.Tensor],
+        feasible_actions: Optional[torch.Tensor] = None,
+        num_families: int = NUM_MANEUVERS,
+    ) -> torch.Tensor:
+        """Aggregate slot logits into legacy maneuver-family logits via log-sum-exp."""
+        if action_family is None:
+            return action_logits
+        if action_family.shape != action_logits.shape:
+            raise ValueError(f"action_family must match logits shape, got {action_family.shape} vs {action_logits.shape}")
+
+        out = action_logits.new_full(action_logits.shape[:-1] + (int(num_families),), float("-inf"))
+        for m in range(int(num_families)):
+            sel = action_family == int(m)
+            if feasible_actions is not None:
+                sel = sel & feasible_actions.to(dtype=torch.bool)
+            logits_m = action_logits.masked_fill(~sel, float("-inf"))
+            out[..., m] = torch.logsumexp(logits_m, dim=-1)
+        out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
+        return out
+
+    @staticmethod
+    def _compute_decision_features(
+        *,
+        ctx: torch.Tensor,                    # [B,N,T,5]
+        comparable_metrics: torch.Tensor,      # [B,N,T,A,C]
+        dynamic_metrics: Optional[torch.Tensor],  # [B,N,T,A,D]
+        action_path_type: torch.Tensor,        # [A]
+        action_constraint_type: torch.Tensor,  # [A]
+        topo_horizon_m: float,
+        conflict_time_s: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute paper feature vector f(m,τ^{det}) and u_ctx inputs.
+
+        Returns
+        -------
+        f : [B,N,T,A,8]
+        ctx_u : [B,N,T,A,3]
+        """
+        B, N, T, A, C = comparable_metrics.shape
+        speed = torch.sqrt(ctx[..., 3] ** 2 + ctx[..., 4] ** 2 + 1e-8)  # [B,N,T]
+        speed_n = (speed / 30.0).clamp(0.0, 2.0).unsqueeze(-1).expand(B, N, T, A)
+
+        path = action_path_type.view(1, 1, 1, A).to(device=ctx.device).expand(B, N, T, A)
+        lon = action_constraint_type.view(1, 1, 1, A).to(device=ctx.device).expand(B, N, T, A)
+
+        gap_m = comparable_metrics[..., 1] * float(topo_horizon_m)
+        ttc_s = comparable_metrics[..., 2] * float(conflict_time_s)
+        ttc_n = (ttc_s / float(conflict_time_s)).clamp(0.0, 2.0)
+
+        on_route = comparable_metrics[..., 5].clamp(0.0, 1.0)
+        stop_flag = comparable_metrics[..., 4].clamp(0.0, 1.0)
+
+        # progress (reward): speed + route bonus + along-path lookahead (cheap proxy)
+        if dynamic_metrics is not None and dynamic_metrics.shape[-1] >= 4:
+            vlim_n = dynamic_metrics[..., 3].clamp(0.0, 2.0)
+        else:
+            vlim_n = speed_n
+        f_prog = (0.7 * vlim_n + 0.3 * on_route).clamp(0.0, 2.0)
+
+        # comfort (cost): curvature + lateral offset
+        if dynamic_metrics is not None and dynamic_metrics.shape[-1] >= 1:
+            curv = dynamic_metrics[..., 0].abs().clamp(0.0, 2.0)
+        else:
+            curv = torch.zeros_like(f_prog)
+        lat = comparable_metrics[..., 3].abs().clamp(0.0, 2.0)
+        f_comfort = (curv + 0.5 * lat).clamp(0.0, 3.0)
+
+        # lane-change cost indicator
+        is_lc = ((path == int(PathType.LANE_CHANGE_LEFT)) | (path == int(PathType.LANE_CHANGE_RIGHT))).to(dtype=f_prog.dtype)
+        f_lc = is_lc
+
+        # stop action indicator
+        f_stop = (lon == int(LonConstraint.STOP_LINE)).to(dtype=f_prog.dtype)
+
+        # interaction safety margins
+        f_ttc = ttc_n
+        f_gap = (gap_m / float(topo_horizon_m)).clamp(0.0, 2.0)
+
+        # priority / stop-rule violation proxy: going through a stop-required branch without STOP_LINE
+        vio = (stop_flag > 0.5) & (lon != int(LonConstraint.STOP_LINE))
+        f_prio = vio.to(dtype=f_prog.dtype)
+
+        # headway cost for follow
+        follow = lon == int(LonConstraint.FOLLOW)
+        thw = gap_m / speed.clamp_min(0.2).unsqueeze(-1)
+        headway_cost = F.relu(1.5 - thw) / 1.5
+        f_headway = torch.where(follow, headway_cost, torch.zeros_like(headway_cost)).clamp(0.0, 2.0)
+
+        f = torch.stack([
+            f_prog,
+            f_comfort,
+            f_lc,
+            f_stop,
+            f_ttc,
+            f_gap,
+            f_prio,
+            f_headway,
+        ], dim=-1)
+
+        # u_ctx inputs (low capacity): [on_route, stop_violation, is_branch]
+        is_branch = ((path == int(PathType.BRANCH_LEFT)) | (path == int(PathType.BRANCH_RIGHT))).to(dtype=f_prog.dtype)
+        ctx_u = torch.stack([
+            on_route,
+            f_prio,
+            is_branch,
+        ], dim=-1)
+
+        return f, ctx_u
 
     def token_log_prob(
         self,
         *,
-        x: torch.Tensor,          # [B,N,T,Dx]
-        tau: torch.Tensor,        # [B,N,T,Dt]
-        ctx: torch.Tensor,        # [B,N,T,Dc]
-        mask: torch.Tensor,       # [B,N,T]
-        feasible_actions: Optional[torch.Tensor] = None,  # [B,N,T,M] bool
-        z: torch.Tensor,          # [B,N,Dz]
+        x: torch.Tensor,                 # [B,N,T,Dx]
+        tau: torch.Tensor,               # [B,N,T,Dt] (unused for policy/emission but kept)
+        ctx: torch.Tensor,               # [B,N,T,Dc]
+        mask: torch.Tensor,              # [B,N,T]
+        feasible_actions: Optional[torch.Tensor] = None,   # [B,N,T,A]
+        action_features: Optional[torch.Tensor] = None,    # kept for API compat (ignored)
+        comparable_metrics: Optional[torch.Tensor] = None, # [B,N,T,A,C]
+        dynamic_metrics: Optional[torch.Tensor] = None,    # [B,N,T,A,D]
+        action_path_type: Optional[torch.Tensor] = None,   # [B,N,T,A] or [A]
+        action_constraint_type: Optional[torch.Tensor] = None,  # [B,N,T,A] or [A]
+        path_polyline_idx: Optional[torch.Tensor] = None,  # [B,N,T,P]
+        map_polylines: Optional[torch.Tensor] = None,      # [B,M,L,2]
+        z: torch.Tensor = None,                 # [B,N,Dz]
     ) -> PrimitiveDecodeOutput:
-        """Return per-token maneuver logits and log-likelihood for each maneuver."""
+        """Return per-token action-slot logits and token log-likelihood."""
+        if z is None:
+            raise ValueError("z is required")
         m = mask > 0.5
 
-        z_mod, z_delta = self.modulation(z, tau)
-        logits = self.policy(z_mod, tau)  # [B,N,T,M]
+        if comparable_metrics is None:
+            raise ValueError("Paper decoder requires comparable_metrics")
 
-        # ------------------------------------------------------------------
-        # Feasible-action masking (paper: m \in A_{i,t})
-        # ------------------------------------------------------------------
+        if dynamic_metrics is None:
+            # allow None (we have fallbacks), but still shape-check if provided
+            pass
+
+        # slot type tensors
+        if action_path_type is None:
+            action_path_type = self.slot_path_type
+        if action_constraint_type is None:
+            action_constraint_type = self.slot_constraint_type
+
+        # allow caller to pass per-token slot types; reduce to [A]
+        if action_path_type.dim() == 4:
+            # [B,N,T,A] -> assume constant over batch/time
+            action_path_type = action_path_type[0, 0, 0]
+        if action_constraint_type.dim() == 4:
+            action_constraint_type = action_constraint_type[0, 0, 0]
+
+        A = int(action_path_type.numel())
+
+        # compute features for policy
+        decision_f, ctx_u = self._compute_decision_features(
+            ctx=ctx,
+            comparable_metrics=comparable_metrics,
+            dynamic_metrics=dynamic_metrics,
+            action_path_type=action_path_type,
+            action_constraint_type=action_constraint_type,
+            topo_horizon_m=self.primitive.topo_horizon_m,
+            conflict_time_s=self.primitive.conflict_time_s,
+        )
+
+        logits, u_ctx = self.policy(z=z, decision_features=decision_f, ctx_features=ctx_u, feasible_actions=feasible_actions)
+
+        # feasible action handling (policy)
         if feasible_actions is not None:
             fa = feasible_actions.to(dtype=torch.bool)
             if fa.shape != logits.shape:
                 raise ValueError(f"feasible_actions must have shape {tuple(logits.shape)}, got {tuple(fa.shape)}")
-
-            # If a token has no feasible maneuver (rare edge case), fall back to all-feasible
-            # to avoid NaNs in log-softmax.
             any_feas = fa.any(dim=-1, keepdim=True)
             fa = torch.where(any_feas, fa, torch.ones_like(fa))
-
             if self.training and self.feasible_action_soft_penalty_train:
-                # Soft penalty during training to avoid brittle masking from imperfect map inference.
-                # Infeasible maneuvers are discouraged but not impossible.
-                penalty = float(self.feasible_action_penalty)
-                logits = logits - (~fa).to(dtype=logits.dtype) * penalty
+                logits = logits - (~fa).to(dtype=logits.dtype) * float(self.feasible_action_penalty)
             else:
-                # Hard mask at evaluation / planning time.
                 if self.feasible_action_hard_mask_eval:
                     logits = logits.masked_fill(~fa, float("-inf"))
                 else:
-                    penalty = float(self.feasible_action_penalty)
-                    logits = logits - (~fa).to(dtype=logits.dtype) * penalty
+                    logits = logits - (~fa).to(dtype=logits.dtype) * float(self.feasible_action_penalty)
 
-        if isinstance(self.emission, FrenetMarginalEmission):
-            logp = self.emission.log_prob(x=x, tau=tau, ctx=ctx, z_mod=z_mod)  # [B,N,T,M]
+        # primitive likelihood for recognition
+        if path_polyline_idx is None or map_polylines is None:
+            # fallback: if geometry is missing, use a weak CV likelihood in Cartesian
+            # (still independent of z)
+            vx = ctx[..., 3]
+            vy = ctx[..., 4]
+            base = torch.stack([vx * self.primitive.dt, vy * self.primitive.dt, torch.zeros_like(vx)], dim=-1)
+            base = base.unsqueeze(-2).expand(*logits.shape, 3)
+            x_e = x.unsqueeze(-2).expand_as(base)
+            err = x_e - base
+            logp = -0.5 * (err**2).sum(dim=-1)
+            if feasible_actions is not None:
+                fa = feasible_actions.to(dtype=torch.bool)
+                any_fa = fa.any(dim=-1, keepdim=True)
+                fa = torch.where(any_fa, fa, torch.ones_like(fa))
+                logp = logp.masked_fill(~fa, float("-inf"))
         else:
-            mean, logstd = self.emission(z_mod=z_mod, tau=tau, ctx=ctx)  # [B,N,T,M,Dx]
-            x_e = x.unsqueeze(-2)  # [B,N,T,1,Dx]
-            logp = self._log_prob_diag_normal(x_e, mean, logstd)  # [B,N,T,M]
+            logp = self.primitive(
+                x=x,
+                ctx=ctx,
+                feasible_actions=feasible_actions,
+                action_path_type=action_path_type,
+                action_constraint_type=action_constraint_type,
+                comparable_metrics=comparable_metrics,
+                path_polyline_idx=path_polyline_idx,
+                map_polylines=map_polylines,
+            )
 
-        # mask invalid tokens
+        # recognition distribution q_χ(m|X,τ): softmax over logp
+        if feasible_actions is not None:
+            fa = feasible_actions.to(dtype=torch.bool)
+            any_fa = fa.any(dim=-1, keepdim=True)
+            fa = torch.where(any_fa, fa, torch.ones_like(fa))
+            logp_for_softmax = logp.masked_fill(~fa, float("-inf"))
+        else:
+            logp_for_softmax = logp
+
+        recog_probs = torch.softmax(logp_for_softmax, dim=-1)
+        # normalized entropy confidence: 1 - H(q)/log|A|
+        eps = 1e-9
+        H = -(recog_probs.clamp_min(eps) * recog_probs.clamp_min(eps).log()).sum(dim=-1)
+        if feasible_actions is not None:
+            A_eff = feasible_actions.to(dtype=torch.float32).sum(dim=-1).clamp_min(1.0)
+        else:
+            A_eff = torch.full_like(H, float(A))
+        recog_conf = 1.0 - H / (A_eff.log().clamp_min(eps))
+        recog_conf = recog_conf.clamp(0.0, 1.0)
+
+        # broadcast z and set delta=0
+        z_mod = z.unsqueeze(2).expand(z.shape[0], z.shape[1], x.shape[2], z.shape[-1])
+        z_delta = torch.zeros_like(z_mod)
+
+        # apply token mask
         m_e = m.unsqueeze(-1)
-
-        # 先把 logp 里的非有限数清掉（可选但非常稳）
-        logp = torch.nan_to_num(logp, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 用 masked_fill 而不是乘 mask（NaN*0 仍是 NaN）
-        logp = logp.masked_fill(~m_e, 0.0)
-
-        # logits 这行保留
         logits = logits.masked_fill(~m_e, 0.0)
+        u_ctx = u_ctx.masked_fill(~m_e, 0.0)
+        decision_f = decision_f.masked_fill(~m_e.unsqueeze(-1), 0.0)
 
-        # z_mod / z_delta 同理
-        z_mod = z_mod.masked_fill(~m_e, 0.0)
-        z_delta = z_delta.masked_fill(~m_e, 0.0)
+        # logp already has -inf for infeasible; for masked timesteps set 0 to avoid NaNs
+        logp = torch.nan_to_num(logp, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf"))
+        logp = torch.where(m_e, logp, torch.zeros_like(logp))
 
-        return PrimitiveDecodeOutput(maneuver_logits=logits, logp_x_given_m=logp, z_mod=z_mod, z_mod_delta=z_delta)
+        recog_probs = recog_probs.masked_fill(~m_e, 0.0)
+        recog_conf = recog_conf * m.to(dtype=recog_conf.dtype)
+
+        return PrimitiveDecodeOutput(
+            maneuver_logits=logits,
+            logp_x_given_m=logp,
+            z_mod=z_mod,
+            z_mod_delta=z_delta,
+            u_ctx=u_ctx,
+            decision_features=decision_f,
+            recog_probs=recog_probs,
+            recog_conf=recog_conf,
+        )
 
     @torch.no_grad()
     def maneuver_logits_last(
@@ -584,16 +843,51 @@ class MotionPrimitiveDecoder(nn.Module):
         z: torch.Tensor,         # [B,N,Dz]
         tau_last: torch.Tensor,  # [B,N,Dt]
         ctx_last: torch.Tensor,  # [B,N,Dc]
-        feasible_actions_last: Optional[torch.Tensor] = None,  # [B,N,M]
+        feasible_actions_last: Optional[torch.Tensor] = None,  # [B,N,A]
+        action_features_last: Optional[torch.Tensor] = None,
+        action_family_last: Optional[torch.Tensor] = None,     # [B,N,A]
+        comparable_metrics_last: Optional[torch.Tensor] = None,
+        dynamic_metrics_last: Optional[torch.Tensor] = None,
+        action_path_type_last: Optional[torch.Tensor] = None,
+        action_constraint_type_last: Optional[torch.Tensor] = None,
+        path_polyline_idx_last: Optional[torch.Tensor] = None,
+        map_polylines: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Convenience: maneuver logits for the last token (T=1)."""
-        tau = tau_last.unsqueeze(2)  # [B,N,1,Dt]
-        ctx = ctx_last.unsqueeze(2)  # [B,N,1,Dc]
-        # dummy x/mask; only logits are used
+        """Legacy maneuver-family logits for the last token."""
+        tau = tau_last.unsqueeze(2)
+        ctx = ctx_last.unsqueeze(2)
         dummy_x = torch.zeros((z.shape[0], z.shape[1], 1, self.x_dim), device=z.device, dtype=z.dtype)
         mask = torch.ones((z.shape[0], z.shape[1], 1), device=z.device, dtype=z.dtype)
-        fa = None
-        if feasible_actions_last is not None:
-            fa = feasible_actions_last.unsqueeze(2)  # [B,N,1,M]
-        out = self.token_log_prob(x=dummy_x, tau=tau, ctx=ctx, mask=mask, feasible_actions=fa, z=z)
-        return out.maneuver_logits.squeeze(2)
+        fa = feasible_actions_last.unsqueeze(2) if feasible_actions_last is not None else None
+
+        cmp = comparable_metrics_last.unsqueeze(2) if comparable_metrics_last is not None else None
+        dyn = dynamic_metrics_last.unsqueeze(2) if dynamic_metrics_last is not None else None
+        ppi = path_polyline_idx_last.unsqueeze(2) if path_polyline_idx_last is not None else None
+
+        out = self.token_log_prob(
+            x=dummy_x,
+            tau=tau,
+            ctx=ctx,
+            mask=mask,
+            feasible_actions=fa,
+            action_features=action_features_last.unsqueeze(2) if action_features_last is not None else None,
+            comparable_metrics=cmp,
+            dynamic_metrics=dyn,
+            action_path_type=action_path_type_last,
+            action_constraint_type=action_constraint_type_last,
+            path_polyline_idx=ppi,
+            map_polylines=map_polylines,
+            z=z,
+        )
+
+        action_logits = out.maneuver_logits.squeeze(2)
+        if action_family_last is None:
+            return action_logits
+
+        family_logits = self.aggregate_family_logits(
+            action_logits.unsqueeze(2),
+            action_family=action_family_last.unsqueeze(2),
+            feasible_actions=fa,
+            num_families=self.num_maneuvers,
+        )
+        return family_logits.squeeze(2)

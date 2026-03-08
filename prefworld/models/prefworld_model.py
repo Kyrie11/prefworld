@@ -77,10 +77,11 @@ class PrefWorldModel(nn.Module):
         self.agent_feat_dim = int(agent_feat_dim)
         self.num_maneuvers = int(num_maneuvers)
 
-        # Template encoder τ (HD-map polylines + neighbor graph)
+        # Template encoder τ (HD-map polylines + neighbor graph + structured action slots)
         self.template = TemplateEncoder(tau_dim=self.tau_dim, agent_state_dim=5, hidden_dim=int(template_hidden))
+        self.action_feature_dim = int(self.template.action_feature_dim)
 
-        # Preference completion on action tokens
+        # Preference completion on structured action tokens
         self.pc = PreferenceCompletion(
             x_dim=3,
             tau_dim=self.tau_dim,
@@ -88,6 +89,7 @@ class PrefWorldModel(nn.Module):
             z_dim=self.z_dim,
             hidden_dim=int(pc_hidden),
             num_maneuvers=self.num_maneuvers,
+            action_feature_dim=self.action_feature_dim,
             context_dependent_prior=bool(pc_context_dependent_prior),
             prior_hidden_dim=pc_prior_hidden,
             maneuver_beta=float(maneuver_beta),
@@ -96,9 +98,10 @@ class PrefWorldModel(nn.Module):
             feasible_action_hard_mask_eval=bool(feasible_action_hard_mask_eval),
         )
 
-        # EFEN / EB-STM (paper-faithful edit-token transition energy)
+        # EFEN / EB-STM now conditions on a structured ego-action descriptor instead of a
+        # pure legacy maneuver one-hot.
         self.energy_net = EditFactorizedEnergyNetEdit(
-            agent_feat_dim=self.agent_feat_dim + self.tau_dim + self.num_maneuvers,
+            agent_feat_dim=self.agent_feat_dim + self.tau_dim + self.action_feature_dim,
             z_dim=self.z_dim,
             hidden_dim=int(energy_hidden),
             lambda_u=float(lambda_u),
@@ -165,7 +168,7 @@ class PrefWorldModel(nn.Module):
         template_out = self.template(
             agents_state=state_all,
             agents_mask=mask_all,
-            map_polylines=map_polylines,
+                map_polylines=map_polylines,
             map_poly_mask=map_poly_mask,
             map_poly_type=map_poly_type,
             map_tl_status=map_tl_status,
@@ -188,23 +191,46 @@ class PrefWorldModel(nn.Module):
         dyaw = torch.atan2(torch.sin(yaw[..., 1:] - yaw[..., :-1]), torch.cos(yaw[..., 1:] - yaw[..., :-1]))
         return torch.cat([dpos, dyaw.unsqueeze(-1)], dim=-1)
 
+    @staticmethod
+    def _select_action_feature_for_family(
+        desired_family: torch.Tensor,          # [B]
+        action_features: torch.Tensor,         # [B,A,D]
+        action_family: torch.Tensor,           # [B,A]
+        feasible_actions: torch.Tensor,        # [B,A]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pick a representative structured action slot for each desired coarse family."""
+        B, A, D = action_features.shape
+        score = torch.arange(A, device=action_features.device, dtype=torch.float32).view(1, A).expand(B, A)
+        fam = desired_family.long().unsqueeze(-1)
+        feas = feasible_actions > 0.5
+        match = feas & (action_family.long() == fam)
+        any_match = match.any(dim=-1, keepdim=True)
+        sel = torch.where(any_match, match, feas)
+        sel = torch.where(sel.any(dim=-1, keepdim=True), sel, torch.ones_like(sel))
+        idx = score.masked_fill(~sel, 1e9).argmin(dim=-1).long()
+        batch_idx = torch.arange(B, device=action_features.device)
+        feat = action_features[batch_idx, idx]
+        return feat, idx
+
     def _build_agent_state_for_eb(
         self,
         ego_dyn: torch.Tensor,            # [B,4] vx,vy,ax,ay (ego-local)
-        ego_maneuver: torch.Tensor,       # [B] int
+        ego_maneuver: torch.Tensor,       # [B] int (legacy family, used to select a structured slot)
         agents_curr: torch.Tensor,        # [B,N,7]
         agents_valid: torch.Tensor,       # [B,N] float
         tau_curr: torch.Tensor,           # [B,1+N,Dt]
+        ego_action_features_curr: Optional[torch.Tensor] = None,  # [B,A,D_a]
+        ego_action_family_curr: Optional[torch.Tensor] = None,    # [B,A]
+        ego_feasible_curr: Optional[torch.Tensor] = None,         # [B,A]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build [B,K,(Da+Dt)+M] features and mask for EB-STM (K=1+N)."""
+        """Build [B,K,(Da+Dt)+D_a] features and mask for EB-STM (K=1+N)."""
         B, N, D = agents_curr.shape
         K = 1 + N
-        feat = torch.zeros((B, K, D + self.tau_dim + self.num_maneuvers), device=agents_curr.device, dtype=agents_curr.dtype)
+        feat = torch.zeros((B, K, D + self.tau_dim + self.action_feature_dim), device=agents_curr.device, dtype=agents_curr.dtype)
         mask = torch.zeros((B, K), device=agents_curr.device, dtype=agents_curr.dtype)
         mask[:, 0] = 1.0
         mask[:, 1:] = agents_valid
 
-        # Ego current pose is origin in ego frame: x=y=yaw=0.
         vx = ego_dyn[:, 0]
         vy = ego_dyn[:, 1]
         ego_base = torch.stack(
@@ -222,14 +248,22 @@ class PrefWorldModel(nn.Module):
         feat[:, 0, :D] = ego_base
         feat[:, 0, D : D + self.tau_dim] = tau_curr[:, 0]
 
-        # Ego action one-hot
-        onehot = F.one_hot(ego_maneuver.long().clamp(min=0, max=self.num_maneuvers - 1), num_classes=self.num_maneuvers).to(feat.dtype)
-        feat[:, 0, D + self.tau_dim :] = onehot
+        if ego_action_features_curr is not None and ego_action_family_curr is not None and ego_feasible_curr is not None:
+            ego_action_feat, _ = self._select_action_feature_for_family(
+                ego_maneuver,
+                ego_action_features_curr,
+                ego_action_family_curr,
+                ego_feasible_curr,
+            )
+        else:
+            ego_action_feat = torch.zeros((B, self.action_feature_dim), device=agents_curr.device, dtype=agents_curr.dtype)
+            n = min(self.num_maneuvers, self.action_feature_dim)
+            ego_onehot = F.one_hot(ego_maneuver.long().clamp(min=0, max=self.num_maneuvers - 1), num_classes=self.num_maneuvers).to(ego_action_feat.dtype)
+            ego_action_feat[:, :n] = ego_onehot[:, :n]
 
-        # Agents
+        feat[:, 0, D + self.tau_dim :] = ego_action_feat
         feat[:, 1:, :D] = agents_curr
         feat[:, 1:, D : D + self.tau_dim] = tau_curr[:, 1:]
-        # action part for non-ego agents is zero
         return feat, mask
 
     @staticmethod
@@ -329,6 +363,8 @@ class PrefWorldModel(nn.Module):
         tau_all = template_out.tau
         tau_agents = tau_all[:, 1:]  # [B,N,T,Dt]
         feasible_all = template_out.feasible_actions
+        action_features_all = template_out.action_features
+        action_family_all = template_out.action_family
 
         # -----------------------------
         # Preference completion
@@ -338,9 +374,18 @@ class PrefWorldModel(nn.Module):
         tau_action = tau_agents[:, :, :-1, :]                   # [B,N,T-1,Dt]
         ctx_action = state_all[:, 1:, :-1, :]                    # [B,N,T-1,5]
         feasible_action = None
+        action_features_action = None
+        action_family_action = None
         if feasible_all is not None:
             feasible_action = feasible_all[:, 1:, :-1, :]
+        if action_features_all is not None:
+            action_features_action = action_features_all[:, 1:, :-1, :, :]
+        if action_family_all is not None:
+            action_family_action = action_family_all[:, 1:, :-1, :]
 
+        comparable_metrics_action = template_out.comparable_metrics[:, 1:, :-1, :, :]
+        dynamic_metrics_action = template_out.dynamic_metrics[:, 1:, :-1, :, :]
+        path_polyline_idx_action = template_out.path_polyline_idx[:, 1:, :-1, :]
         if run_pc:
             pc_out = self.pc(
                 x=x_action,
@@ -348,6 +393,12 @@ class PrefWorldModel(nn.Module):
                 ctx=ctx_action,
                 mask=mask_action,
                 feasible_actions=feasible_action,
+                action_features=action_features_action,
+                action_family=action_family_action,
+                comparable_metrics=comparable_metrics_action,
+                dynamic_metrics=dynamic_metrics_action,
+                path_polyline_idx=path_polyline_idx_action,
+                map_polylines=batch["map_polylines"],
                 split_mode=str(pc_split_mode),
                 query_ratio=float(pc_query_ratio),
                 lambda_distill_mu=float(lambda_distill_mu),
@@ -365,12 +416,15 @@ class PrefWorldModel(nn.Module):
             post_part = pc_out.post_ctx
             loss_pc = pc_out.loss_total
             maneuver_logits_last = pc_out.maneuver_logits_last
+            action_logits_last = pc_out.action_logits_last
+            action_family_last = pc_out.action_family_last
         else:
             pc_out = None
-            # standard normal for non-ego agents
             post_part = None
             loss_pc = torch.zeros((), device=agents_hist.device, dtype=agents_hist.dtype)
             maneuver_logits_last = torch.zeros((B, N, self.num_maneuvers), device=agents_hist.device, dtype=agents_hist.dtype)
+            action_logits_last = None
+            action_family_last = None
 
         # -------------------------------------------------
         # Preference belief tensors (ego + other agents)
@@ -425,7 +479,19 @@ class PrefWorldModel(nn.Module):
             agents_curr = agents_hist[:, :, -1, :]  # [B,N,7]
             ego_dyn_curr = ego_dyn_hist[:, -1, :]   # [B,4]
             tau_curr = tau_all[:, :, -1, :]         # [B,1+N,Dt]
-            eb_feat, eb_mask = self._build_agent_state_for_eb(ego_dyn_curr, ego_m, agents_curr, agents_valid, tau_curr)
+            ego_action_features_curr = action_features_all[:, 0, -1] if action_features_all is not None else None
+            ego_action_family_curr = action_family_all[:, 0, -1] if action_family_all is not None else None
+            ego_feasible_curr = feasible_all[:, 0, -1] if feasible_all is not None else None
+            eb_feat, eb_mask = self._build_agent_state_for_eb(
+                ego_dyn_curr,
+                ego_m,
+                agents_curr,
+                agents_valid,
+                tau_curr,
+                ego_action_features_curr,
+                ego_action_family_curr,
+                ego_feasible_curr,
+            )
 
             # Detach preference belief if we don't want EB gradients flowing into PC.
             z_mean_eb = z_mean.detach() if detach_pc_for_eb else z_mean
@@ -577,6 +643,9 @@ class PrefWorldModel(nn.Module):
                         agents_curr,
                         agents_valid,
                         tau_curr,
+                        ego_action_features_curr,
+                        ego_action_family_curr,
+                        ego_feasible_curr,
                     )
                     out_a = self.ebstm(
                         A_t,
@@ -698,6 +767,16 @@ class PrefWorldModel(nn.Module):
             "z_mean": z_mean[:, 1:].detach() if z_mean.shape[1] > 1 else z_mean.detach(),
             "z_logvar": z_logvar[:, 1:].detach() if z_logvar.shape[1] > 1 else z_logvar.detach(),
         }
+        if action_logits_last is not None:
+            aux["action_logits_last"] = action_logits_last.detach()
+        if action_family_last is not None:
+            aux["action_family_last"] = action_family_last.detach()
+        if feasible_all is not None:
+            aux["ego_feasible_actions_last"] = feasible_all[:, 0, -1].detach()
+        if action_features_all is not None:
+            aux["ego_action_features_last"] = action_features_all[:, 0, -1].detach()
+        if action_family_all is not None:
+            aux["ego_action_family_last"] = action_family_all[:, 0, -1].detach()
 
         if pc_out is not None:
             losses.update(

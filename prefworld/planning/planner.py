@@ -117,6 +117,14 @@ class PlannerOutput:
     ego_traj_yaw: Optional[torch.Tensor] = None  # [B,H(+1)]
 
 
+def _aggregate_family_feasible(feasible_slots: torch.Tensor, action_family: torch.Tensor, num_families: int = NUM_MANEUVERS) -> torch.Tensor:
+    """Collapse structured action-slot feasibility to legacy maneuver families."""
+    out = torch.zeros((*feasible_slots.shape[:-1], int(num_families)), device=feasible_slots.device, dtype=torch.bool)
+    for m in range(int(num_families)):
+        out[..., m] = (feasible_slots.to(torch.bool) & (action_family.long() == int(m))).any(dim=-1)
+    return out
+
+
 def _ego_reference_primitive(
     ego_speed: torch.Tensor,  # [B]
     maneuver: int,
@@ -143,13 +151,13 @@ def _ego_reference_primitive(
     yaw = torch.zeros((B, H), device=ego_speed.device, dtype=ego_speed.dtype)
 
     if maneuver == int(Maneuver.LANE_CHANGE_LEFT):
-        y = lane_width * torch.sigmoid((t - t.mean()) / (0.6)) - 0.5 * lane_width
+        y = (lane_width * torch.sigmoid((t - t.mean()) / 0.6) - 0.5 * lane_width).unsqueeze(0).expand(B, H)
     elif maneuver == int(Maneuver.LANE_CHANGE_RIGHT):
-        y = -lane_width * torch.sigmoid((t - t.mean()) / (0.6)) + 0.5 * lane_width
+        y = (-lane_width * torch.sigmoid((t - t.mean()) / 0.6) + 0.5 * lane_width).unsqueeze(0).expand(B, H)
     elif maneuver == int(Maneuver.TURN_LEFT):
-        yaw = 0.6 * torch.sigmoid((t - t.mean()) / 0.8)
+        yaw = (0.6 * torch.sigmoid((t - t.mean()) / 0.8)).unsqueeze(0).expand(B, H)
     elif maneuver == int(Maneuver.TURN_RIGHT):
-        yaw = -0.6 * torch.sigmoid((t - t.mean()) / 0.8)
+        yaw = (-0.6 * torch.sigmoid((t - t.mean()) / 0.8)).unsqueeze(0).expand(B, H)
 
     x = s
     ref_xy = torch.stack([x, y], dim=-1)  # [B,H,2]
@@ -233,6 +241,8 @@ def plan_with_structures(
     template_out, state_all, _ = model.encode_templates(batch)
     tau_all = template_out.tau
     feasible_all = template_out.feasible_actions
+    action_family_all = template_out.action_family
+    action_features_all = template_out.action_features
     tau_curr = tau_all[:, :, -1, :]
 
     agents_curr = agents_hist[:, :, -1, :]
@@ -245,8 +255,8 @@ def plan_with_structures(
         agents_maneuver = torch.zeros((B, N), device=device, dtype=torch.int64)
 
     # Optionally respect per-agent feasible action masks.
-    if feasible_all is not None:
-        feas_agents = feasible_all[:, 1:, -1, :].to(torch.bool)  # [B,N,M]
+    if feasible_all is not None and action_family_all is not None:
+        feas_agents = _aggregate_family_feasible(feasible_all[:, 1:, -1, :], action_family_all[:, 1:, -1, :], NUM_MANEUVERS)
         keep_id = int(Maneuver.KEEP)
         chosen_ok = feas_agents.gather(dim=-1, index=agents_maneuver.unsqueeze(-1)).squeeze(-1)
         agents_maneuver = torch.where(chosen_ok, agents_maneuver, torch.full_like(agents_maneuver, keep_id))
@@ -272,6 +282,10 @@ def plan_with_structures(
     eb_mask_full = torch.cat([torch.ones((B, 1), device=device, dtype=agents_valid.dtype), agents_valid], dim=1)
     sel_mask = eb_mask_full.clone()  # default: keep individualized for all valid agents
 
+    ego_action_features_curr = action_features_all[:, 0, -1] if action_features_all is not None else None
+    ego_action_family_curr = action_family_all[:, 0, -1] if action_family_all is not None else None
+    ego_feasible_actions_curr = feasible_all[:, 0, -1] if feasible_all is not None else None
+
     if bool(cfg.pci_enabled):
         K = 1 + N
         pci_max = torch.zeros((B, K), device=device, dtype=torch.float32)
@@ -279,7 +293,16 @@ def plan_with_structures(
 
         for a in cfg.pci_coarse_actions:
             ego_a = torch.full((B,), int(a), device=device, dtype=torch.int64)
-            eb_feat_a, eb_mask_a = model._build_agent_state_for_eb(ego_dyn_curr, ego_a, agents_curr, agents_valid, tau_curr)
+            eb_feat_a, eb_mask_a = model._build_agent_state_for_eb(
+                ego_dyn_curr,
+                ego_a,
+                agents_curr,
+                agents_valid,
+                tau_curr,
+                ego_action_features_curr,
+                ego_action_family_curr,
+                ego_feasible_actions_curr,
+            )
 
             pci_res = compute_pci_scores(
                 ebstm=model.ebstm,
@@ -347,14 +370,23 @@ def plan_with_structures(
 
     # Ego feasible maneuvers (if available)
     ego_feasible = None
-    if feasible_all is not None:
-        ego_feasible = feasible_all[:, 0, -1, :].to(torch.bool)  # [B,M]
+    if feasible_all is not None and action_family_all is not None:
+        ego_feasible = _aggregate_family_feasible(feasible_all[:, 0, -1, :], action_family_all[:, 0, -1, :], NUM_MANEUVERS)  # [B,M]
 
     stored_worlds: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     for m in candidate_maneuvers:
         ego_m = torch.full((B,), int(m), device=device, dtype=torch.int64)
-        eb_feat, eb_mask = model._build_agent_state_for_eb(ego_dyn_curr, ego_m, agents_curr, agents_valid, tau_curr)
+        eb_feat, eb_mask = model._build_agent_state_for_eb(
+            ego_dyn_curr,
+            ego_m,
+            agents_curr,
+            agents_valid,
+            tau_curr,
+            ego_action_features_curr,
+            ego_action_family_curr,
+            ego_feasible_actions_curr,
+        )
 
         if cfg.use_beam:
             roll, logp = model.ebstm.beam_rollout(
