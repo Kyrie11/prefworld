@@ -1,5 +1,5 @@
 seed: 0
-device: cuda
+device: cuda:1
 
 # Cached samples OR cached episodes. Stage-1 uses only preference completion.
 dataset:
