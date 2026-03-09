@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     device = torch.device(args.device)

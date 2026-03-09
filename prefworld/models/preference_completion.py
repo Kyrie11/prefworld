@@ -425,6 +425,8 @@ class PreferenceCompletion(nn.Module):
         action_family: Optional[torch.Tensor] = None,
         comparable_metrics: Optional[torch.Tensor] = None,
         dynamic_metrics: Optional[torch.Tensor] = None,
+        action_path_type: Optional[torch.Tensor] = None,
+        action_constraint_type: Optional[torch.Tensor] = None,
         path_polyline_idx: Optional[torch.Tensor] = None,
         map_polylines: Optional[torch.Tensor] = None,
         # overrides (kept for compatibility with training scripts)
@@ -471,6 +473,8 @@ class PreferenceCompletion(nn.Module):
             action_features=action_features,
             comparable_metrics=comparable_metrics,
             dynamic_metrics=dynamic_metrics,
+            action_path_type=action_path_type,
+            action_constraint_type=action_constraint_type,
             path_polyline_idx=path_polyline_idx,
             map_polylines=map_polylines,
             z=z_dummy,

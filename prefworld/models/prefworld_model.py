@@ -386,6 +386,9 @@ class PrefWorldModel(nn.Module):
         comparable_metrics_action = template_out.comparable_metrics[:, 1:, :-1, :, :]
         dynamic_metrics_action = template_out.dynamic_metrics[:, 1:, :-1, :, :]
         path_polyline_idx_action = template_out.path_polyline_idx[:, 1:, :-1, :]
+
+        action_path_type_action = template_out.action_path_type[:, 1:, :-1, :]
+        action_constraint_type_action = template_out.action_constraint_type[:, 1:, :-1, :]
         if run_pc:
             pc_out = self.pc(
                 x=x_action,
@@ -398,6 +401,8 @@ class PrefWorldModel(nn.Module):
                 comparable_metrics=comparable_metrics_action,
                 dynamic_metrics=dynamic_metrics_action,
                 path_polyline_idx=path_polyline_idx_action,
+                action_path_type=action_path_type_action,
+                action_constraint_type = action_constraint_type_action,
                 map_polylines=batch["map_polylines"],
                 split_mode=str(pc_split_mode),
                 query_ratio=float(pc_query_ratio),
