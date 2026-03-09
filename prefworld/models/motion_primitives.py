@@ -132,7 +132,7 @@ def _gather_polylines(
     B, M, L, _ = map_polylines.shape
     if idx.dtype != torch.long:
         idx = idx.long()
-    flat = idx.view(B, -1)
+    flat = idx.reshape(B, -1)
     b = torch.arange(B, device=map_polylines.device).view(B, 1).expand_as(flat)
     gathered = map_polylines[b, flat]  # [B,*,L,2]
     return gathered.view(*idx.shape, L, 2)
